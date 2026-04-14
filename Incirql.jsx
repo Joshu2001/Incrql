@@ -42,7 +42,48 @@ const normalizeModelAlias = (value) => {
   return normalized;
 };
 
-const apiKey = (import.meta.env.VITE_GEMINI_API_KEY || '').trim();
+const RUNTIME_API_KEY_STORAGE_KEY = 'incirql-runtime-gemini-api-key-v1';
+const MISSING_API_KEY_MESSAGE = 'API key missing. Add VITE_GEMINI_API_KEY in Vercel settings and redeploy, or open with ?gemini_api_key=YOUR_KEY once to save it on this device.';
+const readRuntimeApiKey = () => {
+  if (typeof window === 'undefined') return '';
+  try {
+    return String(window.localStorage.getItem(RUNTIME_API_KEY_STORAGE_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+};
+const saveRuntimeApiKey = (value) => {
+  if (typeof window === 'undefined') return;
+  const normalized = String(value || '').trim();
+  if (!normalized) return;
+  try {
+    window.localStorage.setItem(RUNTIME_API_KEY_STORAGE_KEY, normalized);
+  } catch {
+    // Ignore storage failures (private mode / restricted storage)
+  }
+};
+const captureRuntimeApiKeyFromUrl = () => {
+  if (typeof window === 'undefined') return '';
+  try {
+    const url = new URL(window.location.href);
+    const fromUrl = String(url.searchParams.get('gemini_api_key') || url.searchParams.get('api_key') || '').trim();
+    if (!fromUrl) return '';
+    saveRuntimeApiKey(fromUrl);
+    url.searchParams.delete('gemini_api_key');
+    url.searchParams.delete('api_key');
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    return fromUrl;
+  } catch {
+    return '';
+  }
+};
+const resolveApiKey = () => {
+  const envKey = String(import.meta.env.VITE_GEMINI_API_KEY || '').trim();
+  if (envKey) return envKey;
+  const captured = captureRuntimeApiKeyFromUrl();
+  if (captured) return captured;
+  return readRuntimeApiKey();
+};
 const configuredModelName = normalizeModelAlias(import.meta.env.VITE_GEMINI_MODEL || '');
 const primaryModelName = configuredModelName || 'gemini-2.5-flash';
 const modelCandidates = Array.from(new Set([
@@ -306,7 +347,8 @@ const normalizeApiFailureMessage = (message, status) => {
 };
 
 const formatUserFacingAssistantError = (error) => {
-  if (!apiKey) return 'API key missing. Add VITE_GEMINI_API_KEY and restart the app.';
+  const apiKey = resolveApiKey();
+  if (!apiKey) return MISSING_API_KEY_MESSAGE;
 
   const raw = String(error?.message || '').trim();
   const lowered = raw.toLowerCase();
@@ -2351,6 +2393,7 @@ const App = () => {
 
     setCommunityIntentSuggesting(true);
     try {
+      const apiKey = resolveApiKey();
       if (!apiKey) {
         setCommunityAiIntentBoostById({});
         return;
@@ -3900,8 +3943,9 @@ Context thread: ${threadTitle}`;
   };
 
   const tryStreamResponse = async ({ history, userText, systemPrompt, signal, threadId, assistantId, lightweightMode = false, forceClarifyingQuestions = false, attachmentParts = [] }) => {
+    const apiKey = resolveApiKey();
     if (!apiKey) {
-      throw new Error('API key missing. Add VITE_GEMINI_API_KEY.');
+      throw new Error(MISSING_API_KEY_MESSAGE);
     }
 
     let lastError = null;
@@ -4027,8 +4071,9 @@ Context thread: ${threadTitle}`;
   };
 
   const requestNonStreaming = async ({ history, userText, systemPrompt, signal, lightweightMode = false, forceClarifyingQuestions = false, attachmentParts = [] }) => {
+    const apiKey = resolveApiKey();
     if (!apiKey) {
-      throw new Error('API key missing. Add VITE_GEMINI_API_KEY.');
+      throw new Error(MISSING_API_KEY_MESSAGE);
     }
 
     let lastError = null;
