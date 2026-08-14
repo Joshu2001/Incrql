@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { App as CapacitorApp } from '@capacitor/app';
 import { LocalNotifications } from '@capacitor/local-notifications';
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import {
   MessageSquare,
   Search,
@@ -2570,9 +2570,91 @@ const App = () => {
   const [isDetectingLocal, setIsDetectingLocal] = useState(false);
   const [localDetectStatus, setLocalDetectStatus] = useState(null);
 
+  const performHttpCall = async ({ url, method = 'GET', data = null, headers = {}, timeoutMs = 8000 }) => {
+    if (Capacitor.isNativePlatform() && typeof CapacitorHttp !== 'undefined') {
+      const response = await CapacitorHttp.request({
+        url,
+        method,
+        headers,
+        data,
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs,
+      });
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        data: response.data,
+      };
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: data ? (typeof data === 'string' ? data : JSON.stringify(data)) : undefined,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const text = await res.text();
+      let parsed = text;
+      try {
+        parsed = JSON.parse(text);
+      } catch {}
+      return {
+        ok: res.ok,
+        status: res.status,
+        data: parsed,
+      };
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
+    }
+  };
+
+  const testLocalConnection = async (targetUrl = localLlmUrl) => {
+    setIsDetectingLocal(true);
+    setLocalDetectStatus({ type: 'info', msg: `Testing connection to ${targetUrl}...` });
+    const clean = (targetUrl || '').trim().replace(/\/+$/, '');
+    const startTime = Date.now();
+
+    try {
+      const testUrl = clean.endsWith('/v1') ? `${clean}/models` : `${clean}/v1/models`;
+      const res = await performHttpCall({ url: testUrl, method: 'GET', timeoutMs: 5000 });
+      const latency = Date.now() - startTime;
+
+      if (res.ok) {
+        const rawData = typeof res.data === 'string' ? JSON.parse(res.data) : res.data;
+        const models = rawData?.data?.map((m) => m.id) || [];
+        const activeModel = models[0] || localLlmModel || 'default';
+        if (models[0]) {
+          setLocalLlmModel(models[0]);
+          localStorage.setItem('incirql_local_model', models[0]);
+        }
+        setLocalDetectStatus({
+          type: 'success',
+          msg: `Connected successfully (${latency}ms)! Found ${models.length} model(s): ${models.slice(0, 3).join(', ') || activeModel}`,
+        });
+      } else {
+        setLocalDetectStatus({
+          type: 'error',
+          msg: `Server reachable but returned HTTP ${res.status} at ${testUrl}.`,
+        });
+      }
+    } catch (err) {
+      setLocalDetectStatus({
+        type: 'error',
+        msg: `Connection failed: ${err.message || 'Server unreachable'}. Verify your local LLM app server is active at ${targetUrl}.`,
+      });
+    } finally {
+      setIsDetectingLocal(false);
+    }
+  };
+
   const autoDetectLocalLlm = async () => {
     setIsDetectingLocal(true);
-    setLocalDetectStatus({ type: 'info', msg: 'Scanning local ports on device...' });
+    setLocalDetectStatus({ type: 'info', msg: 'Scanning ports 1234, 11434, 8080, 8000 on device...' });
 
     const endpoints = [
       { name: 'LM Playground / LM Studio (1234)', url: 'http://127.0.0.1:1234/v1' },
@@ -2584,16 +2666,14 @@ const App = () => {
     let found = null;
     for (const ep of endpoints) {
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1800);
-        const res = await fetch(`${ep.url}/models`, {
+        const res = await performHttpCall({
+          url: `${ep.url}/models`,
           method: 'GET',
-          signal: controller.signal,
+          timeoutMs: 2000,
         });
-        clearTimeout(timeoutId);
         if (res.ok) {
-          const data = await res.json();
-          const models = data?.data?.map((m) => m.id) || [];
+          const rawData = typeof res.data === 'string' ? JSON.parse(res.data) : res.data;
+          const models = rawData?.data?.map((m) => m.id) || [];
           found = { ...ep, model: models[0] || 'default' };
           break;
         }
@@ -2612,12 +2692,12 @@ const App = () => {
       localStorage.setItem('incirql_provider', 'local');
       setLocalDetectStatus({
         type: 'success',
-        msg: `Connected to ${found.name} [Model: ${found.model}]`,
+        msg: `Found & Connected to ${found.name}! Model: ${found.model}`,
       });
     } else {
       setLocalDetectStatus({
         type: 'error',
-        msg: 'No active local LLM servers found on ports 1234, 11434, 8080, or 8000. Ensure your local server app (e.g. LM Playground) is running with CORS enabled.',
+        msg: 'No local LLM server responded on ports 1234, 11434, 8080, or 8000. Start LM Playground on phone and tap Detect.',
       });
     }
   };
@@ -4776,28 +4856,51 @@ const App = () => {
       { role: 'user', content: userText },
     ];
 
-    try {
-      const response = await fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          model: localModel || 'default',
-          messages: formattedMessages,
-          response_format: { type: 'json_object' },
-          temperature: 0.7,
-        }),
-      });
+    const payloadBody = {
+      model: localModel || 'default',
+      messages: formattedMessages,
+      response_format: { type: 'json_object' },
+      temperature: 0.7,
+    };
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw new Error(`Local LLM server returned error ${response.status}. Check endpoint ${targetUrl}. ${errText.slice(0, 80)}`);
+    try {
+      let rawContent = '';
+      if (Capacitor.isNativePlatform() && typeof CapacitorHttp !== 'undefined') {
+        const nativeRes = await CapacitorHttp.request({
+          url: targetUrl,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          data: payloadBody,
+          connectTimeout: 15000,
+          readTimeout: 60000,
+        });
+
+        if (nativeRes.status < 200 || nativeRes.status >= 300) {
+          const errMsg = typeof nativeRes.data === 'string' ? nativeRes.data : JSON.stringify(nativeRes.data || '');
+          throw new Error(`Local LLM server returned error HTTP ${nativeRes.status}: ${errMsg.slice(0, 100)}`);
+        }
+
+        const dataObj = typeof nativeRes.data === 'string' ? JSON.parse(nativeRes.data) : nativeRes.data;
+        rawContent = dataObj.choices?.[0]?.message?.content || '';
+      } else {
+        const response = await fetch(targetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify(payloadBody),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => '');
+          throw new Error(`Local LLM server returned error HTTP ${response.status}: ${errText.slice(0, 100)}`);
+        }
+
+        const data = await response.json();
+        rawContent = data.choices?.[0]?.message?.content || '';
       }
 
-      const data = await response.json();
-      const rawContent = data.choices?.[0]?.message?.content;
       if (!rawContent) {
-        throw new Error('Local model returned empty content.');
+        throw new Error('Local model returned an empty response. Ensure model weights are loaded in LM Playground.');
       }
 
       let parsedPayload = null;
@@ -4806,7 +4909,11 @@ const App = () => {
       } catch {
         const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
-          parsedPayload = JSON.parse(jsonMatch[0]);
+          try {
+            parsedPayload = JSON.parse(jsonMatch[0]);
+          } catch {
+            parsedPayload = buildFallbackPayloadFromRawText(rawContent);
+          }
         } else {
           parsedPayload = buildFallbackPayloadFromRawText(rawContent);
         }
@@ -4820,7 +4927,7 @@ const App = () => {
       });
     } catch (err) {
       if (err?.name === 'AbortError') throw err;
-      throw new Error(`Local LLM connection error (${localUrl}). Ensure server (LM Playground / Ollama) is running with CORS enabled. ${err.message || ''}`);
+      throw new Error(`Local LLM connection error (${localUrl}): ${err.message || 'Server unreachable'}. Make sure your local server app (LM Playground / Ollama) is active on this device.`);
     }
   };
 
@@ -7812,9 +7919,19 @@ Rules:
               </div>
 
               <div className='space-y-1'>
-                <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
-                  Local Endpoint Base URL
-                </label>
+                <div className='flex items-center justify-between'>
+                  <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
+                    Local Endpoint Base URL
+                  </label>
+                  <button
+                    type='button'
+                    onClick={() => testLocalConnection(localLlmUrl)}
+                    disabled={isDetectingLocal}
+                    className='text-[10px] font-bold text-indigo-600 hover:text-indigo-800 disabled:opacity-50 underline'
+                  >
+                    Test URL
+                  </button>
+                </div>
                 <div className='flex items-center gap-2 bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl'>
                   <Server size={16} className='text-slate-400' />
                   <input

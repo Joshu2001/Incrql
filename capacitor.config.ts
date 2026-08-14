@@ -5,6 +5,11 @@ const config: CapacitorConfig = {
   appName: "Camer",
   webDir: "dist",
   bundledWebRuntime: false,
+  plugins: {
+    CapacitorHttp: {
+      enabled: true,
+    },
+  },
 };
 
 export default config;
