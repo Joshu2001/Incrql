@@ -8177,6 +8177,18 @@ Rules:
                     </div>
                     <span className='text-[9.5px] font-bold text-indigo-600'>Download ↗</span>
                   </a>
+                  <a
+                    href='https://huggingface.co/LiquidAI'
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className='flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200 hover:border-indigo-300 transition-all text-left text-slate-700'
+                  >
+                    <div>
+                      <p className='text-[10px] font-bold text-slate-800'>Liquid AI LFM Models (.onnx)</p>
+                      <p className='text-[8.5px] text-slate-400'>ONNX Mobile Engine • Liquid Architecture</p>
+                    </div>
+                    <span className='text-[9.5px] font-bold text-indigo-600'>Browse ↗</span>
+                  </a>
                 </div>
               </div>
             </div>
