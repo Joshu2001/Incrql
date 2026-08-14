@@ -2585,6 +2585,28 @@ const App = () => {
   const [nativeModelStatus, setNativeModelStatus] = useState(null);
   const [discoveredModels, setDiscoveredModels] = useState([]);
   const [isScanningModels, setIsScanningModels] = useState(false);
+  const [isModelLoading, setIsModelLoading] = useState(false);
+  const [modelLoadProgress, setModelLoadProgress] = useState(0);
+  const [modelLoadStepText, setModelLoadStepText] = useState('');
+
+  useEffect(() => {
+    let sub = null;
+    try {
+      if (typeof NativeLlm !== 'undefined' && NativeLlm.addListener) {
+        NativeLlm.addListener('modelLoadProgress', (data) => {
+          if (data) {
+            setModelLoadProgress(data.percentage || 0);
+            setModelLoadStepText(data.message || '');
+          }
+        }).then((s) => {
+          sub = s;
+        }).catch(() => {});
+      }
+    } catch {}
+    return () => {
+      if (sub && sub.remove) sub.remove();
+    };
+  }, []);
 
   const handlePickModelFile = async () => {
     try {
@@ -2635,8 +2657,11 @@ const App = () => {
 
   const handleLoadNativeModel = async (path) => {
     if (!path) return;
+    setIsModelLoading(true);
+    setModelLoadProgress(15);
+    setModelLoadStepText('Reading model file from phone storage...');
+    setLocalDetectStatus({ type: 'info', msg: `Initializing ${path.split('/').pop()}...` });
     try {
-      setLocalDetectStatus({ type: 'info', msg: `Loading ${path}...` });
       const res = await NativeLlm.loadModel({ path });
       setNativeModelStatus(res);
       setNativeModelPath(path);
@@ -2645,15 +2670,22 @@ const App = () => {
       localStorage.setItem('incirql_native_model_path', path);
       localStorage.setItem('incirql_native_model_name', res.name || 'model.gguf');
       localStorage.setItem('incirql_provider', 'ondevice_gguf');
+      setModelLoadProgress(100);
+      setModelLoadStepText('Model verified and ready!');
       setLocalDetectStatus({
         type: 'success',
-        msg: `Loaded ${res.name} (${res.sizeFormatted || 'ready'}) for on-device inference!`,
+        msg: `Verified & loaded ${res.name} (${res.sizeFormatted || 'ready'}) into phone RAM for on-device inference!`,
       });
     } catch (err) {
+      setNativeModelStatus(null);
+      setModelLoadProgress(0);
+      setModelLoadStepText('');
       setLocalDetectStatus({
         type: 'error',
-        msg: `Failed to load model: ${err.message || 'Invalid model file'}`,
+        msg: `Failed to load model: ${err.message || 'Architecture not supported by mobile llama.cpp'}`,
       });
+    } finally {
+      setIsModelLoading(false);
     }
   };
 
@@ -8050,7 +8082,25 @@ Rules:
                   </div>
                 </div>
 
-                {nativeModelPath ? (
+                {isModelLoading && (
+                  <div className='bg-indigo-50 border border-indigo-200 rounded-xl p-3 space-y-2 animate-in fade-in'>
+                    <div className='flex items-center justify-between text-[10px] font-bold text-indigo-900'>
+                      <span className='flex items-center gap-1.5'>
+                        <RefreshCw size={11} className='animate-spin text-indigo-600' />
+                        {modelLoadStepText || 'Loading weights into RAM...'}
+                      </span>
+                      <span>{modelLoadProgress}%</span>
+                    </div>
+                    <div className='w-full bg-indigo-100 rounded-full h-2 overflow-hidden'>
+                      <div
+                        className='bg-indigo-600 h-2 rounded-full transition-all duration-300'
+                        style={{ width: `${Math.max(5, modelLoadProgress)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {nativeModelPath && !isModelLoading ? (
                   <div className='bg-white border border-indigo-100 rounded-xl p-2.5 flex items-center gap-2'>
                     <FileText size={16} className='text-indigo-600 flex-shrink-0' />
                     <div className='min-w-0 flex-1'>
@@ -8058,12 +8108,12 @@ Rules:
                       <p className='text-[9px] text-slate-400 truncate'>{nativeModelPath}</p>
                     </div>
                     <span className='text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 flex-shrink-0'>
-                      Loaded ✓
+                      Ready ✓
                     </span>
                   </div>
-                ) : (
+                ) : !isModelLoading ? (
                   <p className='text-[10px] text-slate-500 italic'>No .gguf model selected yet. Tap "Pick File" or "Scan Storage".</p>
-                )}
+                ) : null}
               </div>
 
               {discoveredModels.length > 0 && (
