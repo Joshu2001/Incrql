@@ -32,6 +32,12 @@ import {
   HelpCircle,
   Lightbulb,
   Eye,
+  Server,
+  Cpu,
+  RefreshCw,
+  CheckCircle2,
+  AlertCircle,
+  Settings,
 } from 'lucide-react';
 
 const normalizeModelAlias = (value) => {
@@ -2546,6 +2552,75 @@ const App = () => {
   const [swipeOffset, setSwipeOffset] = useState(0);
   const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
   const [isExplorePanelOpen, setIsExplorePanelOpen] = useState(false);
+  const [isEngineSettingsOpen, setIsEngineSettingsOpen] = useState(false);
+
+  // Local LLM & Engine State
+  const [llmProvider, setLlmProvider] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('incirql_provider') : '') || 'gemini'
+  );
+  const [localLlmUrl, setLocalLlmUrl] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('incirql_local_url') : '') || 'http://127.0.0.1:1234/v1'
+  );
+  const [localLlmModel, setLocalLlmModel] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('incirql_local_model') : '') || 'llama3'
+  );
+  const [customGeminiApiKey, setCustomGeminiApiKey] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('incirql_gemini_key') : '') || ''
+  );
+  const [isDetectingLocal, setIsDetectingLocal] = useState(false);
+  const [localDetectStatus, setLocalDetectStatus] = useState(null);
+
+  const autoDetectLocalLlm = async () => {
+    setIsDetectingLocal(true);
+    setLocalDetectStatus({ type: 'info', msg: 'Scanning local ports on device...' });
+
+    const endpoints = [
+      { name: 'LM Playground / LM Studio (1234)', url: 'http://127.0.0.1:1234/v1' },
+      { name: 'Ollama (11434)', url: 'http://127.0.0.1:11434/v1' },
+      { name: 'llama.cpp / LocalAI (8080)', url: 'http://127.0.0.1:8080/v1' },
+      { name: 'vLLM (8000)', url: 'http://127.0.0.1:8000/v1' },
+    ];
+
+    let found = null;
+    for (const ep of endpoints) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1800);
+        const res = await fetch(`${ep.url}/models`, {
+          method: 'GET',
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          const data = await res.json();
+          const models = data?.data?.map((m) => m.id) || [];
+          found = { ...ep, model: models[0] || 'default' };
+          break;
+        }
+      } catch {
+        // continue
+      }
+    }
+
+    setIsDetectingLocal(false);
+    if (found) {
+      setLocalLlmUrl(found.url);
+      setLocalLlmModel(found.model);
+      setLlmProvider('local');
+      localStorage.setItem('incirql_local_url', found.url);
+      localStorage.setItem('incirql_local_model', found.model);
+      localStorage.setItem('incirql_provider', 'local');
+      setLocalDetectStatus({
+        type: 'success',
+        msg: `Connected to ${found.name} [Model: ${found.model}]`,
+      });
+    } else {
+      setLocalDetectStatus({
+        type: 'error',
+        msg: 'No active local LLM servers found on ports 1234, 11434, 8080, or 8000. Ensure your local server app (e.g. LM Playground) is running with CORS enabled.',
+      });
+    }
+  };
   const [isGroupBuilderOpen, setIsGroupBuilderOpen] = useState(false);
   const [editingGroupThreadId, setEditingGroupThreadId] = useState(null);
   const [groupBuilderSelectedPersonaIds, setGroupBuilderSelectedPersonaIds] = useState([]);
@@ -4684,7 +4759,77 @@ const App = () => {
     return `${personaBlock}\n${protocolBlock}\n${personaExecutionDirective}\nJSON only: {"bursts":["msg"],"insight":"optional","depthCard":null,"questions":[],"suggestedQuestions":[]}\nRules:\n- Max 2 bursts. Keep each burst concrete and outcome-driven.\n- Questions must be targeted and directly tied to the current step.\n- Suggested questions must be tappable user replies that advance execution.\n- Avoid generic principles unless linked to a specific decision or tradeoff.\n- No markdown fences.${vagueMode ? ' Keep diagnosis short and ask only what is missing.' : ''}${personalClause}\n${ctx}`;
   };
 
+  const requestLocalLlm = async ({ history, userText, systemPrompt, signal, attachmentParts = [] }) => {
+    const localUrl = (typeof window !== 'undefined' ? localStorage.getItem('incirql_local_url') : '') || 'http://127.0.0.1:1234/v1';
+    const localModel = (typeof window !== 'undefined' ? localStorage.getItem('incirql_local_model') : '') || 'llama3';
+    const cleanBaseUrl = localUrl.trim().replace(/\/+$/, '');
+    const targetUrl = cleanBaseUrl.endsWith('/v1')
+      ? `${cleanBaseUrl}/chat/completions`
+      : `${cleanBaseUrl}/v1/chat/completions`;
+
+    const formattedMessages = [
+      { role: 'system', content: systemPrompt },
+      ...history.map((msg) => ({
+        role: msg.role === 'user' ? 'user' : 'assistant',
+        content: typeof msg.content === 'string' ? msg.content : serializeMessageForModelHistory(msg),
+      })),
+      { role: 'user', content: userText },
+    ];
+
+    try {
+      const response = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal,
+        body: JSON.stringify({
+          model: localModel || 'default',
+          messages: formattedMessages,
+          response_format: { type: 'json_object' },
+          temperature: 0.7,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`Local LLM server returned error ${response.status}. Check endpoint ${targetUrl}. ${errText.slice(0, 80)}`);
+      }
+
+      const data = await response.json();
+      const rawContent = data.choices?.[0]?.message?.content;
+      if (!rawContent) {
+        throw new Error('Local model returned empty content.');
+      }
+
+      let parsedPayload = null;
+      try {
+        parsedPayload = JSON.parse(rawContent);
+      } catch {
+        const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          parsedPayload = JSON.parse(jsonMatch[0]);
+        } else {
+          parsedPayload = buildFallbackPayloadFromRawText(rawContent);
+        }
+      }
+
+      return normalizeAssistantPayloadSchema(parsedPayload, {
+        allowQuestionFallback: true,
+        forceClarifyingQuestions: false,
+        actionMode: false,
+        modeContext: null,
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err;
+      throw new Error(`Local LLM connection error (${localUrl}). Ensure server (LM Playground / Ollama) is running with CORS enabled. ${err.message || ''}`);
+    }
+  };
+
   const tryStreamResponse = async ({ history, userText, systemPrompt, signal, threadId, assistantId, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [], responseBudget = 'default' }) => {
+    const activeProvider = (typeof window !== 'undefined' ? localStorage.getItem('incirql_provider') : '') || 'gemini';
+    if (activeProvider === 'local') {
+      return requestLocalLlm({ history, userText, systemPrompt, signal, attachmentParts });
+    }
+
     const apiKey = resolveApiKey();
     if (!apiKey) {
       throw new Error(MISSING_API_KEY_MESSAGE);
@@ -4869,6 +5014,11 @@ const App = () => {
   };
 
   const requestNonStreaming = async ({ history, userText, systemPrompt, signal, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [] }) => {
+    const activeProvider = (typeof window !== 'undefined' ? localStorage.getItem('incirql_provider') : '') || 'gemini';
+    if (activeProvider === 'local') {
+      return requestLocalLlm({ history, userText, systemPrompt, signal, attachmentParts });
+    }
+
     const apiKey = resolveApiKey();
     if (!apiKey) {
       throw new Error(MISSING_API_KEY_MESSAGE);
@@ -7132,11 +7282,14 @@ Rules:
           className='flex-1 min-w-0 text-left'
         >
           <h3 className='font-bold text-slate-900 truncate text-sm tracking-tight'>{activeThread.title}</h3>
-          <p className='text-[9px] font-black text-green-600 uppercase tracking-widest mt-0.5'>
-            {activeThread.isGroup ? 'Tap To Edit Group • Online' : 'Secure Feed • Online'}
+          <p className='text-[9px] font-black text-indigo-600 uppercase tracking-widest mt-0.5'>
+            {activeThread.isGroup ? 'Tap To Edit Group' : (llmProvider === 'local' ? '⚡ LOCAL LLM' : '✨ GEMINI CLOUD')} • ONLINE
           </p>
         </button>
-        <button type='button' onClick={() => setIsChatSettingsOpen(true)} className='p-1 text-slate-400 hover:text-slate-700 transition-colors'>
+        <button type='button' onClick={() => setIsEngineSettingsOpen(true)} className='p-1 text-slate-400 hover:text-indigo-600 transition-colors' title='Intelligence Engine Settings'>
+          <Settings size={18} strokeWidth={2} />
+        </button>
+        <button type='button' onClick={() => setIsChatSettingsOpen(true)} className='p-1 text-slate-400 hover:text-slate-700 transition-colors' title='Chat Settings'>
           <MoreVertical size={20} strokeWidth={2} />
         </button>
       </header>
@@ -7582,6 +7735,174 @@ Rules:
     );
   };
 
+  const renderEngineSettingsModal = () => {
+    if (!isEngineSettingsOpen) return null;
+    return (
+      <div className='fixed inset-0 z-[95] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200' onClick={() => setIsEngineSettingsOpen(false)}>
+        <div className='w-full max-w-md bg-white rounded-[2.2rem] border border-sky-100 shadow-2xl p-6 space-y-5 relative overflow-hidden' onClick={(e) => e.stopPropagation()}>
+          <div className='flex items-center justify-between border-b border-slate-100 pb-3.5'>
+            <div className='flex items-center gap-3'>
+              <div className='w-10 h-10 rounded-2xl bg-indigo-50 flex items-center justify-center text-indigo-600 font-bold'>
+                <Cpu size={20} />
+              </div>
+              <div>
+                <h2 className='font-extrabold text-slate-900 text-base'>Intelligence Engine</h2>
+                <p className='text-[10px] text-slate-400 font-semibold uppercase tracking-wider'>
+                  Cloud & On-Device Local LLMs
+                </p>
+              </div>
+            </div>
+            <button type='button' onClick={() => setIsEngineSettingsOpen(false)} className='w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center text-slate-500 hover:bg-slate-200 transition-colors'>
+              <X size={16} />
+            </button>
+          </div>
+
+          <div className='space-y-2'>
+            <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
+              Active Provider
+            </label>
+            <div className='grid grid-cols-2 gap-2 bg-slate-100 p-1.5 rounded-2xl'>
+              <button
+                type='button'
+                onClick={() => {
+                  setLlmProvider('gemini');
+                  localStorage.setItem('incirql_provider', 'gemini');
+                }}
+                className={`py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-2 transition-all ${
+                  llmProvider === 'gemini'
+                    ? 'bg-white text-indigo-600 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                Gemini Cloud
+              </button>
+              <button
+                type='button'
+                onClick={() => {
+                  setLlmProvider('local');
+                  localStorage.setItem('incirql_provider', 'local');
+                }}
+                className={`py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-2 transition-all ${
+                  llmProvider === 'local'
+                    ? 'bg-white text-indigo-600 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                Local LLM
+              </button>
+            </div>
+          </div>
+
+          {llmProvider === 'local' ? (
+            <div className='space-y-3.5 animate-in fade-in duration-200'>
+              <div className='bg-indigo-50/80 border border-indigo-100 p-3.5 rounded-2xl flex items-center justify-between'>
+                <div>
+                  <p className='text-[11px] font-bold text-slate-800'>Auto-Detect Local LLM</p>
+                  <p className='text-[9px] text-slate-500'>Scans LM Playground (1234), Ollama (11434)...</p>
+                </div>
+                <button
+                  type='button'
+                  onClick={autoDetectLocalLlm}
+                  disabled={isDetectingLocal}
+                  className='px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-indigo-100 disabled:opacity-50 transition-all'
+                >
+                  <RefreshCw size={13} className={isDetectingLocal ? 'animate-spin' : ''} />
+                  {isDetectingLocal ? 'Scanning...' : 'Detect'}
+                </button>
+              </div>
+
+              <div className='space-y-1'>
+                <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
+                  Local Endpoint Base URL
+                </label>
+                <div className='flex items-center gap-2 bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl'>
+                  <Server size={16} className='text-slate-400' />
+                  <input
+                    type='text'
+                    value={localLlmUrl}
+                    onChange={(e) => {
+                      setLocalLlmUrl(e.target.value);
+                      localStorage.setItem('incirql_local_url', e.target.value);
+                    }}
+                    placeholder='http://127.0.0.1:1234/v1'
+                    className='bg-transparent text-xs text-slate-800 outline-none w-full font-medium'
+                  />
+                </div>
+              </div>
+
+              <div className='space-y-1'>
+                <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
+                  Model Name
+                </label>
+                <div className='flex items-center gap-2 bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl'>
+                  <Cpu size={16} className='text-slate-400' />
+                  <input
+                    type='text'
+                    value={localLlmModel}
+                    onChange={(e) => {
+                      setLocalLlmModel(e.target.value);
+                      localStorage.setItem('incirql_local_model', e.target.value);
+                    }}
+                    placeholder='llama3 or default'
+                    className='bg-transparent text-xs text-slate-800 outline-none w-full font-medium'
+                  />
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className='space-y-3 animate-in fade-in duration-200'>
+              <div className='space-y-1'>
+                <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
+                  Gemini API Key
+                </label>
+                <input
+                  type='password'
+                  value={customGeminiApiKey}
+                  onChange={(e) => {
+                    setCustomGeminiApiKey(e.target.value);
+                    localStorage.setItem('incirql_gemini_key', e.target.value);
+                  }}
+                  placeholder='AIzaSy... (leave blank if set in .env)'
+                  className='w-full bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl text-xs text-slate-800 outline-none font-medium'
+                />
+              </div>
+              <p className='text-[10px] text-slate-400'>
+                Model: <span className='font-bold text-slate-700'>{primaryModelName}</span>
+              </p>
+            </div>
+          )}
+
+          {localDetectStatus && (
+            <div
+              className={`p-3 rounded-2xl text-xs font-semibold flex items-start gap-2 ${
+                localDetectStatus.type === 'success'
+                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-100'
+                  : localDetectStatus.type === 'info'
+                  ? 'bg-sky-50 text-sky-800 border border-sky-100'
+                  : 'bg-rose-50 text-rose-800 border border-rose-100'
+              }`}
+            >
+              {localDetectStatus.type === 'success' ? (
+                <CheckCircle2 size={16} className='text-emerald-500 flex-shrink-0 mt-0.5' />
+              ) : (
+                <AlertCircle size={16} className='text-rose-500 flex-shrink-0 mt-0.5' />
+              )}
+              <span className='leading-snug'>{localDetectStatus.msg}</span>
+            </div>
+          )}
+
+          <button
+            type='button'
+            onClick={() => setIsEngineSettingsOpen(false)}
+            className='w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-extrabold text-xs rounded-2xl shadow-lg transition-all'
+          >
+            Save & Close
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   const renderHomeHeader = (title) => (
     <header className='fixed top-0 inset-x-0 md:left-1/2 md:-translate-x-1/2 md:w-full md:max-w-md px-5 pt-12 pb-6 z-50 space-y-6 bg-[#eaf6ff]/80 backdrop-blur-sm'>
       <div className='bg-white/88 backdrop-blur-md border border-sky-100 shadow-sm flex items-center px-4 py-3 rounded-2xl'>
@@ -7599,9 +7920,30 @@ Rules:
           placeholder={activeTab === 'communities' ? ' Search mentors by name, role, or expertise ' : ' What are you working on? '}
           className='bg-transparent border-none outline-none text-[14px] w-full text-slate-900 placeholder:text-slate-500 font-semibold'
         />
+        <button
+          type='button'
+          onClick={() => setIsEngineSettingsOpen(true)}
+          className='ml-2 p-1 text-slate-400 hover:text-indigo-600 transition-colors flex-shrink-0'
+          title='Intelligence Engine Settings'
+        >
+          <Settings size={18} />
+        </button>
       </div>
       <div className='flex items-center justify-between px-1'>
-        <h1 className='text-xl font-extrabold text-slate-900 tracking-tight'>{title}</h1>
+        <div className='flex items-center gap-2'>
+          <h1 className='text-xl font-extrabold text-slate-900 tracking-tight'>{title}</h1>
+          <button
+            type='button'
+            onClick={() => setIsEngineSettingsOpen(true)}
+            className={`text-[8px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border transition-all ${
+              llmProvider === 'local'
+                ? 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
+                : 'bg-sky-50 text-sky-700 border-sky-200 hover:bg-sky-100'
+            }`}
+          >
+            {llmProvider === 'local' ? 'Local LLM' : 'Gemini Cloud'}
+          </button>
+        </div>
         {activeTab === 'communities' && (
           <button
             type='button'
@@ -8227,6 +8569,7 @@ Rules:
             </div>
           </div>
         )}
+        {renderEngineSettingsModal()}
       </div>
     </div>
   );
