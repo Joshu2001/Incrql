@@ -4999,10 +4999,10 @@ const App = () => {
           try {
             parsedPayload = JSON.parse(jsonMatch[0]);
           } catch {
-            parsedPayload = buildFallbackPayloadFromRawText(rawContent);
+            parsedPayload = buildPayloadFromText(rawContent);
           }
         } else {
-          parsedPayload = buildFallbackPayloadFromRawText(rawContent);
+          parsedPayload = buildPayloadFromText(rawContent);
         }
       }
 
@@ -5043,10 +5043,10 @@ const App = () => {
           try {
             parsedPayload = JSON.parse(jsonMatch[0]);
           } catch {
-            parsedPayload = buildFallbackPayloadFromRawText(rawContent);
+            parsedPayload = buildPayloadFromText(rawContent);
           }
         } else {
-          parsedPayload = buildFallbackPayloadFromRawText(rawContent || 'Generated response from on-device model.');
+          parsedPayload = buildPayloadFromText(rawContent || 'Generated response from on-device model.');
         }
       }
 
