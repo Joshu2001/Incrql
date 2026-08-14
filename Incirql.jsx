@@ -41,6 +41,7 @@ import {
   FolderOpen,
   FileText,
   Smartphone,
+  Sparkles,
 } from 'lucide-react';
 
 const NativeLlm = registerPlugin('NativeLlm');
