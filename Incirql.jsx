@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { App as CapacitorApp } from '@capacitor/app';
 import { LocalNotifications } from '@capacitor/local-notifications';
-import { Capacitor, CapacitorHttp } from '@capacitor/core';
+import { Capacitor, CapacitorHttp, registerPlugin } from '@capacitor/core';
 import {
   MessageSquare,
   Search,
@@ -38,7 +38,12 @@ import {
   CheckCircle2,
   AlertCircle,
   Settings,
+  FolderOpen,
+  FileText,
+  Smartphone,
 } from 'lucide-react';
+
+const NativeLlm = registerPlugin('NativeLlm');
 
 const normalizeModelAlias = (value) => {
   const normalized = String(value || '').trim();
@@ -2570,6 +2575,88 @@ const App = () => {
   const [isDetectingLocal, setIsDetectingLocal] = useState(false);
   const [localDetectStatus, setLocalDetectStatus] = useState(null);
 
+  // On-Device GGUF State
+  const [nativeModelPath, setNativeModelPath] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('incirql_native_model_path') : '') || ''
+  );
+  const [nativeModelName, setNativeModelName] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('incirql_native_model_name') : '') || ''
+  );
+  const [nativeModelStatus, setNativeModelStatus] = useState(null);
+  const [discoveredModels, setDiscoveredModels] = useState([]);
+  const [isScanningModels, setIsScanningModels] = useState(false);
+
+  const handlePickModelFile = async () => {
+    try {
+      setLocalDetectStatus({ type: 'info', msg: 'Opening Android storage picker...' });
+      const result = await NativeLlm.pickModelFile();
+      if (result && result.path) {
+        setNativeModelPath(result.path);
+        setNativeModelName(result.name || 'model.gguf');
+        localStorage.setItem('incirql_native_model_path', result.path);
+        localStorage.setItem('incirql_native_model_name', result.name || 'model.gguf');
+        await handleLoadNativeModel(result.path);
+      }
+    } catch (err) {
+      setLocalDetectStatus({
+        type: 'error',
+        msg: `File selection error: ${err.message || 'Cancelled'}`,
+      });
+    }
+  };
+
+  const handleScanDeviceModels = async () => {
+    setIsScanningModels(true);
+    setLocalDetectStatus({ type: 'info', msg: 'Scanning Downloads folder for .gguf & .bin models...' });
+    try {
+      const res = await NativeLlm.scanLocalModelFiles();
+      const models = res?.models || [];
+      setDiscoveredModels(models);
+      if (models.length > 0) {
+        setLocalDetectStatus({
+          type: 'success',
+          msg: `Found ${models.length} model file(s) on device! Tap any file below to load.`,
+        });
+      } else {
+        setLocalDetectStatus({
+          type: 'info',
+          msg: 'No .gguf files found in Downloads. Tap "Pick File" to select a model from any folder.',
+        });
+      }
+    } catch (err) {
+      setLocalDetectStatus({
+        type: 'error',
+        msg: `Scan failed: ${err.message || 'Storage permission required'}`,
+      });
+    } finally {
+      setIsScanningModels(false);
+    }
+  };
+
+  const handleLoadNativeModel = async (path) => {
+    if (!path) return;
+    try {
+      setLocalDetectStatus({ type: 'info', msg: `Loading ${path}...` });
+      const res = await NativeLlm.loadModel({ path });
+      setNativeModelStatus(res);
+      setNativeModelPath(path);
+      setNativeModelName(res.name || 'model.gguf');
+      setLlmProvider('ondevice_gguf');
+      localStorage.setItem('incirql_native_model_path', path);
+      localStorage.setItem('incirql_native_model_name', res.name || 'model.gguf');
+      localStorage.setItem('incirql_provider', 'ondevice_gguf');
+      setLocalDetectStatus({
+        type: 'success',
+        msg: `Loaded ${res.name} (${res.sizeFormatted || 'ready'}) for on-device inference!`,
+      });
+    } catch (err) {
+      setLocalDetectStatus({
+        type: 'error',
+        msg: `Failed to load model: ${err.message || 'Invalid model file'}`,
+      });
+    }
+  };
+
   const performHttpCall = async ({ url, method = 'GET', data = null, headers = {}, timeoutMs = 8000 }) => {
     if (Capacitor.isNativePlatform() && typeof CapacitorHttp !== 'undefined') {
       const response = await CapacitorHttp.request({
@@ -4931,9 +5018,56 @@ const App = () => {
     }
   };
 
+  const requestOnDeviceGguf = async ({ history, userText, systemPrompt, signal, attachmentParts = [] }) => {
+    const savedPath = (typeof window !== 'undefined' ? localStorage.getItem('incirql_native_model_path') : '') || '';
+    if (!savedPath) {
+      throw new Error('No on-device GGUF model loaded. Please select a .gguf model in Engine Settings.');
+    }
+
+    const formattedPrompt = `${systemPrompt}\n\nUser: ${userText}\nAssistant:`;
+
+    try {
+      const res = await NativeLlm.generateCompletion({
+        prompt: formattedPrompt,
+        systemPrompt,
+        temperature: 0.7,
+      });
+
+      const rawContent = res.text || res.content || '';
+      let parsedPayload = null;
+      try {
+        parsedPayload = JSON.parse(rawContent);
+      } catch {
+        const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            parsedPayload = JSON.parse(jsonMatch[0]);
+          } catch {
+            parsedPayload = buildFallbackPayloadFromRawText(rawContent);
+          }
+        } else {
+          parsedPayload = buildFallbackPayloadFromRawText(rawContent || 'Generated response from on-device model.');
+        }
+      }
+
+      return normalizeAssistantPayloadSchema(parsedPayload, {
+        allowQuestionFallback: true,
+        forceClarifyingQuestions: false,
+        actionMode: false,
+        modeContext: null,
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err;
+      throw new Error(`On-Device GGUF error: ${err.message || 'Inference failed'}. Verify model is loaded in Engine Settings.`);
+    }
+  };
+
   const tryStreamResponse = async ({ history, userText, systemPrompt, signal, threadId, assistantId, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [], responseBudget = 'default' }) => {
     const activeProvider = (typeof window !== 'undefined' ? localStorage.getItem('incirql_provider') : '') || 'gemini';
-    if (activeProvider === 'local') {
+    if (activeProvider === 'ondevice_gguf') {
+      return requestOnDeviceGguf({ history, userText, systemPrompt, signal, attachmentParts });
+    }
+    if (activeProvider === 'local' || activeProvider === 'local_http') {
       return requestLocalLlm({ history, userText, systemPrompt, signal, attachmentParts });
     }
 
@@ -5122,7 +5256,10 @@ const App = () => {
 
   const requestNonStreaming = async ({ history, userText, systemPrompt, signal, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [] }) => {
     const activeProvider = (typeof window !== 'undefined' ? localStorage.getItem('incirql_provider') : '') || 'gemini';
-    if (activeProvider === 'local') {
+    if (activeProvider === 'ondevice_gguf') {
+      return requestOnDeviceGguf({ history, userText, systemPrompt, signal, attachmentParts });
+    }
+    if (activeProvider === 'local' || activeProvider === 'local_http') {
       return requestLocalLlm({ history, userText, systemPrompt, signal, attachmentParts });
     }
 
@@ -7390,7 +7527,7 @@ Rules:
         >
           <h3 className='font-bold text-slate-900 truncate text-sm tracking-tight'>{activeThread.title}</h3>
           <p className='text-[9px] font-black text-indigo-600 uppercase tracking-widest mt-0.5'>
-            {activeThread.isGroup ? 'Tap To Edit Group' : (llmProvider === 'local' ? '⚡ LOCAL LLM' : '✨ GEMINI CLOUD')} • ONLINE
+            {activeThread.isGroup ? 'Tap To Edit Group' : (llmProvider === 'ondevice_gguf' ? '📱 ON-DEVICE GGUF' : llmProvider === 'local' ? '⚡ LOCAL HTTP' : '✨ GEMINI CLOUD')} • ONLINE
           </p>
         </button>
         <button type='button' onClick={() => setIsEngineSettingsOpen(true)} className='p-1 text-slate-400 hover:text-indigo-600 transition-colors' title='Intelligence Engine Settings'>
@@ -7866,22 +8003,37 @@ Rules:
 
           <div className='space-y-2'>
             <label className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
-              Active Provider
+              Active Intelligence Provider
             </label>
-            <div className='grid grid-cols-2 gap-2 bg-slate-100 p-1.5 rounded-2xl'>
+            <div className='grid grid-cols-3 gap-1.5 bg-slate-100 p-1.5 rounded-2xl'>
+              <button
+                type='button'
+                onClick={() => {
+                  setLlmProvider('ondevice_gguf');
+                  localStorage.setItem('incirql_provider', 'ondevice_gguf');
+                }}
+                className={`py-2 px-1.5 rounded-xl font-extrabold text-[10.5px] flex items-center justify-center gap-1 transition-all ${
+                  llmProvider === 'ondevice_gguf'
+                    ? 'bg-white text-indigo-600 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <Smartphone size={13} />
+                On-Device
+              </button>
               <button
                 type='button'
                 onClick={() => {
                   setLlmProvider('gemini');
                   localStorage.setItem('incirql_provider', 'gemini');
                 }}
-                className={`py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-2 transition-all ${
+                className={`py-2 px-1.5 rounded-xl font-extrabold text-[10.5px] flex items-center justify-center gap-1 transition-all ${
                   llmProvider === 'gemini'
                     ? 'bg-white text-indigo-600 shadow-sm'
                     : 'text-slate-500 hover:text-slate-800'
                 }`}
               >
-                Gemini Cloud
+                Cloud
               </button>
               <button
                 type='button'
@@ -7889,18 +8041,94 @@ Rules:
                   setLlmProvider('local');
                   localStorage.setItem('incirql_provider', 'local');
                 }}
-                className={`py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-2 transition-all ${
+                className={`py-2 px-1.5 rounded-xl font-extrabold text-[10.5px] flex items-center justify-center gap-1 transition-all ${
                   llmProvider === 'local'
                     ? 'bg-white text-indigo-600 shadow-sm'
                     : 'text-slate-500 hover:text-slate-800'
                 }`}
               >
-                Local LLM
+                <Server size={13} />
+                Local HTTP
               </button>
             </div>
           </div>
 
-          {llmProvider === 'local' ? (
+          {llmProvider === 'ondevice_gguf' ? (
+            <div className='space-y-3.5 animate-in fade-in duration-200'>
+              <div className='bg-indigo-50/80 border border-indigo-100 p-3.5 rounded-2xl space-y-2.5'>
+                <div className='flex items-center justify-between'>
+                  <div>
+                    <p className='text-[11px] font-bold text-slate-800'>Load GGUF Model File</p>
+                    <p className='text-[9px] text-slate-500'>Runs directly on phone storage (offline)</p>
+                  </div>
+                  <div className='flex gap-1.5'>
+                    <button
+                      type='button'
+                      onClick={handleScanDeviceModels}
+                      disabled={isScanningModels}
+                      className='px-2.5 py-1.5 rounded-xl bg-white border border-indigo-200 text-indigo-700 font-bold text-[10px] flex items-center gap-1 hover:bg-indigo-50 transition-all'
+                    >
+                      <RefreshCw size={11} className={isScanningModels ? 'animate-spin' : ''} />
+                      {isScanningModels ? 'Scanning...' : 'Scan Storage'}
+                    </button>
+                    <button
+                      type='button'
+                      onClick={handlePickModelFile}
+                      className='px-2.5 py-1.5 rounded-xl bg-indigo-600 text-white font-bold text-[10px] flex items-center gap-1 shadow-sm hover:bg-indigo-700 transition-all'
+                    >
+                      <FolderOpen size={12} />
+                      Pick File
+                    </button>
+                  </div>
+                </div>
+
+                {nativeModelPath ? (
+                  <div className='bg-white border border-indigo-100 rounded-xl p-2.5 flex items-center gap-2'>
+                    <FileText size={16} className='text-indigo-600 flex-shrink-0' />
+                    <div className='min-w-0 flex-1'>
+                      <p className='text-[11px] font-bold text-slate-800 truncate'>{nativeModelName || 'model.gguf'}</p>
+                      <p className='text-[9px] text-slate-400 truncate'>{nativeModelPath}</p>
+                    </div>
+                    <span className='text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 flex-shrink-0'>
+                      Loaded ✓
+                    </span>
+                  </div>
+                ) : (
+                  <p className='text-[10px] text-slate-500 italic'>No .gguf model selected yet. Tap "Pick File" or "Scan Storage".</p>
+                )}
+              </div>
+
+              {discoveredModels.length > 0 && (
+                <div className='space-y-1.5'>
+                  <p className='text-[10px] font-black uppercase tracking-wider text-slate-500'>
+                    Found on Device ({discoveredModels.length})
+                  </p>
+                  <div className='space-y-1.5 max-h-36 overflow-y-auto pr-1'>
+                    {discoveredModels.map((m, idx) => (
+                      <button
+                        key={idx}
+                        type='button'
+                        onClick={() => handleLoadNativeModel(m.path)}
+                        className={`w-full text-left p-2.5 rounded-xl border flex items-center justify-between transition-all ${
+                          nativeModelPath === m.path
+                            ? 'bg-indigo-50 border-indigo-300 text-indigo-900'
+                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-white'
+                        }`}
+                      >
+                        <div className='min-w-0 flex-1 pr-2'>
+                          <p className='text-[11px] font-bold truncate'>{m.name}</p>
+                          <p className='text-[9px] text-slate-400'>{m.type} • {m.sizeFormatted}</p>
+                        </div>
+                        <span className='text-[10px] font-bold text-indigo-600 flex-shrink-0'>
+                          {nativeModelPath === m.path ? 'Loaded ✓' : 'Load →'}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : llmProvider === 'local' ? (
             <div className='space-y-3.5 animate-in fade-in duration-200'>
               <div className='bg-indigo-50/80 border border-indigo-100 p-3.5 rounded-2xl flex items-center justify-between'>
                 <div>
@@ -8053,12 +8281,14 @@ Rules:
             type='button'
             onClick={() => setIsEngineSettingsOpen(true)}
             className={`text-[8px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border transition-all ${
-              llmProvider === 'local'
+              llmProvider === 'ondevice_gguf'
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
+                : llmProvider === 'local'
                 ? 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
                 : 'bg-sky-50 text-sky-700 border-sky-200 hover:bg-sky-100'
             }`}
           >
-            {llmProvider === 'local' ? 'Local LLM' : 'Gemini Cloud'}
+            {llmProvider === 'ondevice_gguf' ? '📱 On-Device' : llmProvider === 'local' ? '⚡ Local HTTP' : '✨ Gemini Cloud'}
           </button>
         </div>
         {activeTab === 'communities' && (
