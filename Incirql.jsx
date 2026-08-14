@@ -37,10 +37,22 @@ import {
 const normalizeModelAlias = (value) => {
   const normalized = String(value || '').trim();
   if (!normalized) return '';
-  if (/gemini-.*pro/i.test(normalized)) return 'gemini-2.5-flash';
-  if (normalized === 'gemini-1.5-flash' || normalized === 'gemini-2.0-flash') return 'gemini-2.5-flash';
+  if (/gemini-.*pro/i.test(normalized)) return 'gemini-2.5-flash-lite';
+  if (normalized === 'gemini-1.5-flash' || normalized === 'gemini-2.0-flash') return 'gemini-2.5-flash-lite';
   return normalized;
 };
+
+const parseEnvBoolean = (value) => /^(1|true|yes|on)$/i.test(String(value || '').trim());
+
+const parseEnvNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const parseModelList = (value) => String(value || '')
+  .split(',')
+  .map((model) => normalizeModelAlias(model))
+  .filter(Boolean);
 
 const RUNTIME_API_KEY_STORAGE_KEY = 'incirql-runtime-gemini-api-key-v1';
 const MISSING_API_KEY_MESSAGE = 'API key missing. Add VITE_GEMINI_API_KEY in Vercel settings and redeploy, or open with ?gemini_api_key=YOUR_KEY once to save it on this device.';
@@ -85,19 +97,24 @@ const resolveApiKey = () => {
   return readRuntimeApiKey();
 };
 const configuredModelName = normalizeModelAlias(import.meta.env.VITE_GEMINI_MODEL || '');
-const primaryModelName = configuredModelName || 'gemini-2.5-flash';
+const primaryModelName = configuredModelName || 'gemini-2.5-flash-lite';
+const configuredFallbackModels = parseModelList(import.meta.env.VITE_GEMINI_FALLBACK_MODELS || '');
 const modelCandidates = Array.from(new Set([
   primaryModelName,
-  'gemini-2.5-flash-lite',
+  ...configuredFallbackModels,
 ].filter(Boolean).map((model) => normalizeModelAlias(model))));
-const GEMINI_SERVICE_TIER = 'priority';
-let geminiServiceTierEnabled = true;
+const GEMINI_SERVICE_TIER = String(import.meta.env.VITE_GEMINI_SERVICE_TIER || '').trim();
+let geminiServiceTierEnabled = Boolean(GEMINI_SERVICE_TIER);
 const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const FATAL_HTTP_STATUSES = new Set([400, 401, 403]);
-const MAX_ATTEMPTS_PER_MODEL = 3;
-const BASE_RETRY_DELAY_MS = 160;
-const GROUP_HISTORY_WINDOW = 8;
-const INDIVIDUAL_HISTORY_WINDOW = 5;
+const MAX_ATTEMPTS_PER_MODEL = parseEnvNumber(import.meta.env.VITE_GEMINI_MAX_ATTEMPTS, 1);
+const BASE_RETRY_DELAY_MS = parseEnvNumber(import.meta.env.VITE_GEMINI_BASE_RETRY_DELAY_MS, 100);
+const GROUP_HISTORY_WINDOW = 2;
+const INDIVIDUAL_HISTORY_WINDOW = 1;
+const MODEL_REQUEST_TIMEOUT_MS = parseEnvNumber(import.meta.env.VITE_GEMINI_REQUEST_TIMEOUT_MS, 20000);
+const MODEL_HEDGE_DELAY_MS = parseEnvNumber(import.meta.env.VITE_GEMINI_HEDGE_DELAY_MS, 1200);
+const STREAM_RENDER_THROTTLE_MS = parseEnvNumber(import.meta.env.VITE_GEMINI_STREAM_RENDER_THROTTLE_MS, 100);
+const STREAM_RETRY_MAX_OUTPUT_TOKENS = parseEnvNumber(import.meta.env.VITE_GEMINI_STREAM_RETRY_MAX_OUTPUT_TOKENS, 96);
 const LOCAL_STATE_KEY = 'incirql-chat-local-state-v1';
 const NOTIFICATION_CHANNEL_ID = 'incirql-messages-v3';
 const COACH_DEFAULT_MORNING_TIME = '08:00';
@@ -107,6 +124,12 @@ const COACH_INACTIVITY_TRIGGER_MS = 16 * 60 * 60 * 1000;
 const COACH_PENDING_RESPONSE_NUDGE_MS = 10 * 60 * 60 * 1000;
 const MAX_ATTACHMENT_COUNT = 4;
 const MAX_ATTACHMENT_SIZE_BYTES = 8 * 1024 * 1024;
+const MAX_INLINE_IMAGE_BYTES = parseEnvNumber(import.meta.env.VITE_GEMINI_MAX_INLINE_IMAGE_BYTES, 900 * 1024);
+const MAX_INLINE_AUDIO_BYTES = parseEnvNumber(import.meta.env.VITE_GEMINI_MAX_INLINE_AUDIO_BYTES, 2 * 1024 * 1024);
+const MAX_INLINE_PDF_BYTES = parseEnvNumber(import.meta.env.VITE_GEMINI_MAX_INLINE_PDF_BYTES, 1024 * 1024);
+const MAX_IMAGE_DIMENSION = parseEnvNumber(import.meta.env.VITE_GEMINI_MAX_IMAGE_DIMENSION, 1600);
+const COMMUNITY_INTENT_BATCH_WINDOW_MS = parseEnvNumber(import.meta.env.VITE_GEMINI_INTENT_BATCH_WINDOW_MS, 180);
+const COMMUNITY_INTENT_BATCH_MAX = parseEnvNumber(import.meta.env.VITE_GEMINI_INTENT_BATCH_MAX, 6);
 const ATTACHMENT_ACCEPT_ATTR = 'image/*,audio/*,.pdf,.txt,.md,.json,.csv,.doc,.docx';
 
 const INLINE_ATTACHMENT_MIME_PREFIXES = ['image/', 'audio/'];
@@ -296,6 +319,125 @@ const parseApiFailure = async (response) => {
   };
 };
 
+const normalizeModelRequestError = (error, modelName) => {
+  if (error?.name === 'AbortError') return error;
+  if (error?.__isModelRequestError) return error;
+
+  const status = Number(error?.status || 0);
+  const message = normalizeApiFailureMessage(error?.message || 'Network request failed', status);
+  return {
+    __isModelRequestError: true,
+    modelName,
+    status,
+    message,
+    retryAfterMs: Number(error?.retryAfterMs || 0),
+    retryable: isRetryableApiFailure(status, message),
+  };
+};
+
+const runParallelModelRequestWave = async ({
+  requestSignal,
+  requestBody,
+  endpointBuilder,
+  parseFailure = parseApiFailure,
+}) => {
+  const requestControllers = [];
+  let winningModelName = null;
+  let hasWinner = false;
+
+  const requests = modelCandidates.map((modelName, index) => {
+    const controller = new AbortController();
+    requestControllers.push({ modelName, controller });
+
+    const modelSignal = combineAbortSignals(requestSignal, controller.signal);
+    const startDelayMs = Math.max(0, index * MODEL_HEDGE_DELAY_MS);
+
+    return (async () => {
+      if (startDelayMs > 0) {
+        await waitForRetry(startDelayMs, modelSignal);
+        if (hasWinner) throw new DOMException('aborted', 'AbortError');
+      }
+
+      const endpoint = endpointBuilder(modelName);
+
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: modelSignal,
+          body: JSON.stringify(requestBody),
+        });
+
+        if (!response.ok) {
+          const failure = await parseFailure(response);
+          throw {
+            __isModelRequestError: true,
+            modelName,
+            status: Number(failure?.status || response.status || 0),
+            message: normalizeApiFailureMessage(failure?.message || '', Number(failure?.status || response.status || 0)),
+            retryAfterMs: Number(failure?.retryAfterMs || 0),
+            retryable: isRetryableApiFailure(Number(failure?.status || response.status || 0), failure?.message || ''),
+          };
+        }
+
+        return { modelName, response };
+      } catch (error) {
+        throw normalizeModelRequestError(error, modelName);
+      }
+    })();
+  });
+
+  try {
+    const winner = await Promise.any(requests);
+    hasWinner = true;
+    winningModelName = winner.modelName;
+    requestControllers.forEach(({ modelName, controller }) => {
+      if (modelName !== winner.modelName) controller.abort();
+    });
+    return { winner, failures: [] };
+  } catch (error) {
+    const failures = Array.isArray(error?.errors)
+      ? error.errors
+      : [error];
+
+    if (requestSignal?.aborted || failures.some((entry) => entry?.name === 'AbortError')) {
+      throw new DOMException('aborted', 'AbortError');
+    }
+
+    return {
+      winner: null,
+      failures: failures
+        .map((entry) => normalizeModelRequestError(entry, entry?.modelName || 'unknown'))
+        .filter((entry) => entry?.__isModelRequestError),
+    };
+  } finally {
+    requestControllers.forEach(({ modelName, controller }) => {
+      if (!winningModelName || modelName !== winningModelName) controller.abort();
+    });
+  }
+};
+
+const getPreferredFailure = (failures = []) => {
+  if (!failures.length) return null;
+  return failures.find((failure) => FATAL_HTTP_STATUSES.has(failure.status))
+    || failures.find((failure) => failure.retryable)
+    || failures[0];
+};
+
+const normalizeIntentKey = (value) => String(value || '').trim().toLowerCase();
+
+const buildCommunityIntentBoostMap = (ranked = [], validAdvisorIds = new Set()) => {
+  const boost = {};
+  ranked.slice(0, 8).forEach((item, index) => {
+    const advisorId = String(item?.id || '').trim();
+    if (!advisorId || !validAdvisorIds.has(advisorId)) return;
+    const score = Number(item?.score);
+    const normalized = Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : Math.max(50, 100 - (index * 10));
+    boost[advisorId] = Math.max(boost[advisorId] || 0, Math.round(normalized / 3));
+  });
+  return boost;
+};
+
 const isRetryableApiFailure = (status, message = '') => {
   if (FATAL_HTTP_STATUSES.has(status)) return false;
   if (RETRYABLE_HTTP_STATUSES.has(status)) return true;
@@ -306,7 +448,7 @@ const isRetryableApiFailure = (status, message = '') => {
 
 const buildGenerationConfig = (baseConfig = {}) => {
   const nextConfig = { ...baseConfig };
-  if (geminiServiceTierEnabled) {
+  if (geminiServiceTierEnabled && GEMINI_SERVICE_TIER) {
     nextConfig.service_tier = GEMINI_SERVICE_TIER;
   }
   return nextConfig;
@@ -322,6 +464,28 @@ const getRetryDelayMs = (attemptIndex, retryAfterMs = 0) => {
   const backoffMs = Math.min(6000, BASE_RETRY_DELAY_MS * (2 ** attemptIndex));
   const jitterMs = Math.floor(Math.random() * 250);
   return Math.max(backoffMs + jitterMs, retryAfterMs || 0);
+};
+
+const normalizeAbortToTimeoutError = (error, deadlineSignal, userSignal) => {
+  if (error?.name !== 'AbortError') return error;
+  if (deadlineSignal?.aborted && !userSignal?.aborted) {
+    const timeoutError = new Error('Request timed out');
+    timeoutError.name = 'TimeoutError';
+    timeoutError.code = 'REQUEST_TIMEOUT';
+    return timeoutError;
+  }
+  return error;
+};
+
+const shouldFallbackToNonStreaming = (error) => {
+  const status = Number(error?.status || 0);
+  if (status === 400 || status === 422) return true;
+
+  if (error?.name === 'TimeoutError') return true;
+  if (error?.code === 'EMPTY_STREAM' || error?.code === 'STREAM_UNAVAILABLE') return true;
+
+  const lowered = String(error?.message || '').toLowerCase();
+  return /(request was rejected by the model api|unsupported|unrecognized|invalid (json|argument|value)|additional propert|schema|response mime|malformed|empty stream|streaming transport unavailable|stream unavailable)/i.test(lowered);
 };
 
 const normalizeApiFailureMessage = (message, status) => {
@@ -390,11 +554,11 @@ const RESPONSE_STYLE_OPTIONS = [
 ];
 
 const RESPONSE_STYLE_RULES = {
-  balanced: 'Use a balanced strategic tone and medium detail.',
-  talkative: 'Use richer detail with additional practical context while staying conversational.',
+  balanced: 'Install a mental model: use philosophical framing with first-principles thinking. Build conceptual clarity and reasoning frameworks the user can apply beyond this one decision. Stay strategic and principle-driven.',
+  talkative: 'Use richer detail with additional practical context while staying conversational. Balance depth with accessibility. Include examples and reasoning to deepen understanding.',
   busy: 'Assume user is busy. Keep advice practical and immediately actionable.',
-  brief: 'Be concise. Prefer short lines and direct recommendations.',
-  encouraging: 'Use an encouraging, confident tone with practical next steps.',
+  brief: 'Cut all fluff. Direct, sharp, no elaboration. One decision. One next step. No padding.',
+  encouraging: 'Use an encouraging, confident tone focused on motivating action. Acknowledge effort, build momentum, and make the next step feel achievable and energizing.',
 };
 
 const STOP_WORDS = new Set(['the', 'and', 'for', 'with', 'from', 'that', 'this', 'your', 'you', 'are', 'into', 'over', 'about', 'what', 'when', 'where', 'which', 'will', 'have', 'has', 'had', 'its', 'our', 'their', 'they', 'them', 'was', 'were', 'been', 'being', 'too', 'very', 'just', 'more', 'less', 'only', 'then', 'than']);
@@ -444,6 +608,116 @@ const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
   reader.readAsDataURL(file);
 });
 
+const getBase64FromDataUrl = (dataUrl) => {
+  const raw = String(dataUrl || '');
+  if (!raw.includes(',')) return '';
+  return raw.split(',')[1] || '';
+};
+
+const estimateBase64Bytes = (base64) => {
+  const safe = String(base64 || '').trim();
+  if (!safe) return 0;
+  let padding = 0;
+  if (safe.endsWith('==')) padding = 2;
+  else if (safe.endsWith('=')) padding = 1;
+  return Math.max(0, Math.floor((safe.length * 3) / 4) - padding);
+};
+
+const loadImageFromDataUrl = (dataUrl) => new Promise((resolve, reject) => {
+  const image = new Image();
+  image.onload = () => resolve(image);
+  image.onerror = () => reject(new Error('Unable to decode image for compression.'));
+  image.src = dataUrl;
+});
+
+const compressImageDataUrl = async (dataUrl, mimeType) => {
+  const base64 = getBase64FromDataUrl(dataUrl);
+  const originalBytes = estimateBase64Bytes(base64);
+  if (!originalBytes || originalBytes <= MAX_INLINE_IMAGE_BYTES) {
+    return {
+      dataUrl,
+      base64,
+      mimeType: String(mimeType || 'image/jpeg').toLowerCase(),
+      estimatedBytes: originalBytes,
+      compressed: false,
+    };
+  }
+
+  const image = await loadImageFromDataUrl(dataUrl);
+  const originalWidth = image.naturalWidth || image.width || 1;
+  const originalHeight = image.naturalHeight || image.height || 1;
+  const maxEdge = Math.max(originalWidth, originalHeight);
+  const scaleBase = Math.min(1, MAX_IMAGE_DIMENSION / maxEdge);
+
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d', { alpha: false });
+  if (!context) {
+    return {
+      dataUrl,
+      base64,
+      mimeType: String(mimeType || 'image/jpeg').toLowerCase(),
+      estimatedBytes: originalBytes,
+      compressed: false,
+    };
+  }
+
+  const candidateMimes = [
+    String(mimeType || '').toLowerCase() === 'image/png' ? 'image/webp' : 'image/jpeg',
+    'image/jpeg',
+  ];
+
+  const qualityLevels = [0.82, 0.74, 0.68, 0.6, 0.52];
+  const scaleLevels = [1, 0.85, 0.72];
+
+  let best = {
+    dataUrl,
+    base64,
+    mimeType: String(mimeType || 'image/jpeg').toLowerCase(),
+    estimatedBytes: originalBytes,
+    compressed: false,
+  };
+
+  for (const candidateMime of candidateMimes) {
+    for (const scaleFactor of scaleLevels) {
+      const width = Math.max(1, Math.round(originalWidth * scaleBase * scaleFactor));
+      const height = Math.max(1, Math.round(originalHeight * scaleBase * scaleFactor));
+      canvas.width = width;
+      canvas.height = height;
+      context.clearRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+
+      for (const quality of qualityLevels) {
+        const candidateDataUrl = canvas.toDataURL(candidateMime, quality);
+        const candidateBase64 = getBase64FromDataUrl(candidateDataUrl);
+        const candidateBytes = estimateBase64Bytes(candidateBase64);
+        if (!candidateBytes) continue;
+
+        if (candidateBytes < best.estimatedBytes) {
+          best = {
+            dataUrl: candidateDataUrl,
+            base64: candidateBase64,
+            mimeType: candidateMime,
+            estimatedBytes: candidateBytes,
+            compressed: true,
+          };
+        }
+
+        if (candidateBytes <= MAX_INLINE_IMAGE_BYTES) {
+          return {
+            dataUrl: candidateDataUrl,
+            base64: candidateBase64,
+            mimeType: candidateMime,
+            estimatedBytes: candidateBytes,
+            compressed: true,
+          };
+        }
+      }
+    }
+  }
+
+  return best;
+};
+
 const readFileAsText = (file) => new Promise((resolve, reject) => {
   const reader = new FileReader();
   reader.onload = () => resolve(String(reader.result || ''));
@@ -473,8 +747,71 @@ const buildAttachmentPayload = async (file) => {
   }
 
   if (isInlineAttachmentMime(mimeType)) {
+    if (mimeType.startsWith('image/')) {
+      const originalDataUrl = await readFileAsDataUrl(file);
+      const compressed = await compressImageDataUrl(originalDataUrl, mimeType);
+      if (compressed.base64) {
+        return {
+          ...base,
+          size: compressed.estimatedBytes || base.size,
+          dataUrl: compressed.dataUrl,
+          inlineData: {
+            mimeType: compressed.mimeType,
+            data: compressed.base64,
+          },
+          textExcerpt: compressed.compressed
+            ? `Image ${base.name} compressed to ${bytesToReadable(compressed.estimatedBytes)} for faster model routing.`
+            : '',
+        };
+      }
+    }
+
+    if (mimeType.startsWith('audio/')) {
+      if (base.size > MAX_INLINE_AUDIO_BYTES) {
+        return {
+          ...base,
+          textExcerpt: `Audio ${base.name} kept as metadata to reduce latency (${bytesToReadable(base.size)} > ${bytesToReadable(MAX_INLINE_AUDIO_BYTES)} inline budget).`,
+        };
+      }
+
+      const dataUrl = await readFileAsDataUrl(file);
+      const base64 = getBase64FromDataUrl(dataUrl);
+      if (base64) {
+        return {
+          ...base,
+          dataUrl,
+          inlineData: {
+            mimeType,
+            data: base64,
+          },
+        };
+      }
+    }
+
+    if (mimeType === 'application/pdf') {
+      if (base.size > MAX_INLINE_PDF_BYTES) {
+        return {
+          ...base,
+          textExcerpt: `PDF ${base.name} kept as metadata to reduce latency (${bytesToReadable(base.size)} > ${bytesToReadable(MAX_INLINE_PDF_BYTES)} inline budget).`,
+        };
+      }
+
+      const dataUrl = await readFileAsDataUrl(file);
+      const base64 = getBase64FromDataUrl(dataUrl);
+      if (base64) {
+        return {
+          ...base,
+          dataUrl,
+          inlineData: {
+            mimeType,
+            data: base64,
+          },
+        };
+      }
+    }
+
     const dataUrl = await readFileAsDataUrl(file);
-    const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : '';
+    const base64 = getBase64FromDataUrl(dataUrl);
     if (base64) {
       return {
         ...base,
@@ -547,7 +884,22 @@ const serializeMessageForModelHistory = (msg) => {
     : '';
 
   const compact = `${baseText}${attachmentMeta}`.replace(/\s+/g, ' ').trim();
-  return compact.length > 700 ? `${compact.slice(0, 700)}...` : compact;
+  return compact.length > 350 ? `${compact.slice(0, 350)}...` : compact;
+};
+
+const combineAbortSignals = (...signals) => {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+
+  signals.filter(Boolean).forEach((signal) => {
+    if (signal.aborted) {
+      controller.abort();
+      return;
+    }
+    signal.addEventListener('abort', abort, { once: true });
+  });
+
+  return controller.signal;
 };
 
 const isLegacyGateArtifactMessage = (msg) => {
@@ -836,6 +1188,9 @@ const PERSONA_PROFILE_OVERRIDES = {
     communicationTone: 'direct and exacting',
     stageRelevance: 'growth-scaling',
     decisionBias: 'quality and user experience over feature sprawl',
+    executionPriorities: ['craft one crisp user outcome', 'remove unnecessary scope', 'ship a polished core path'],
+    rejectPatterns: ['feature sprawl without user value', 'vague roadmaps with no ownership'],
+    signatureQuestion: 'What would make this feel inevitable to the end user in one minute?',
     confidenceBoundary: 'Avoid detailed legal, tax, or medical instructions.',
   },
   simons: {
@@ -844,6 +1199,9 @@ const PERSONA_PROFILE_OVERRIDES = {
     communicationTone: 'concise and data-first',
     stageRelevance: 'intermediate-advanced',
     decisionBias: 'measurable edge over narrative confidence',
+    executionPriorities: ['define explicit entry/exit rules', 'log each setup with data', 'evaluate edge by measurable outcomes'],
+    rejectPatterns: ['story-first trading plans', 'signals without testable criteria'],
+    signatureQuestion: 'What metric would falsify this setup quickly?',
     confidenceBoundary: 'Avoid discretionary macro calls without data-backed setup.',
   },
   buffett: {
@@ -852,6 +1210,9 @@ const PERSONA_PROFILE_OVERRIDES = {
     communicationTone: 'calm and practical',
     stageRelevance: 'beginner-scaling',
     decisionBias: 'downside protection before upside optionality',
+    executionPriorities: ['protect downside first', 'focus on compounding quality', 'prefer understandable decisions'],
+    rejectPatterns: ['forced timing calls', 'complexity without margin of safety'],
+    signatureQuestion: 'What downside are you accepting, and is it worth the expected upside?',
     confidenceBoundary: 'Avoid short-term trading timing directives.',
   },
   hormozi: {
@@ -860,7 +1221,43 @@ const PERSONA_PROFILE_OVERRIDES = {
     communicationTone: 'blunt and actionable',
     stageRelevance: 'beginner-growth',
     decisionBias: 'execution velocity with clear unit economics',
+    executionPriorities: ['ship one revenue test now', 'tie actions to measurable pipeline metrics', 'repeat what works and cut what does not'],
+    rejectPatterns: ['motivation without execution', 'advice that is not tied to numbers'],
+    signatureQuestion: 'What are you shipping in the next 24 hours that can generate demand?',
     confidenceBoundary: 'Avoid legal/compliance specifics without local constraints.',
+  },
+  pgraham: {
+    domainExpertise: ['startup', 'founder-market fit', 'product'],
+    thinkingStyle: 'pragmatic and founder-first',
+    communicationTone: 'blunt and execution-first',
+    stageRelevance: 'early-stage',
+    decisionBias: 'build and test quickly before theorizing',
+    executionPriorities: ['ship an artifact in 48 hours', 'talk to real users before polishing', 'force concrete writing and decisions'],
+    rejectPatterns: ['strategy theater without building', 'abstract essays that avoid a next action'],
+    signatureQuestion: 'What can you build and ship in 48 hours to get real user signal?',
+    confidenceBoundary: 'Avoid pretending certainty without user feedback loops.',
+  },
+  thiel: {
+    domainExpertise: ['strategy', 'competition', '0-to-1'],
+    thinkingStyle: 'contrarian and asymmetry-seeking',
+    communicationTone: 'precise and intellectually adversarial',
+    stageRelevance: 'early-scaling',
+    decisionBias: 'non-obvious differentiation over consensus execution',
+    executionPriorities: ['surface one non-obvious truth', 'define a narrow beachhead to dominate', 'articulate defensibility early'],
+    rejectPatterns: ['consensus positioning', 'commodity plans with no moat'],
+    signatureQuestion: 'What truth do you see that strong competitors are still ignoring?',
+    confidenceBoundary: 'Avoid deterministic predictions framed as certainty.',
+  },
+  chesky: {
+    domainExpertise: ['design', 'experience', 'brand'],
+    thinkingStyle: 'experience-driven and narrative-led',
+    communicationTone: 'clear, human, and emotionally precise',
+    stageRelevance: 'early-growth',
+    decisionBias: 'delight and trust before scale mechanics',
+    executionPriorities: ['define one memorable user moment', 'tighten story and interaction quality', 'design for love not just utility'],
+    rejectPatterns: ['feature lists with no experience arc', 'execution that ignores trust and emotion'],
+    signatureQuestion: 'What would make someone love this enough to tell another person today?',
+    confidenceBoundary: 'Avoid growth tactics that degrade user trust.',
   },
 };
 
@@ -896,6 +1293,9 @@ const inferPersonaProfile = (advisor) => {
     communicationTone,
     stageRelevance,
     decisionBias: 'clarity and outcomes over abstract theory',
+    executionPriorities: ['lock one concrete outcome', 'run one immediate action step', 'measure result quickly and adapt'],
+    rejectPatterns: ['generic advice with no concrete step', 'making decisions for the user without their attempt'],
+    signatureQuestion: 'What is the next concrete step you will complete before leaving this chat?',
     confidenceBoundary: 'If a request is outside your competence, state limits and defer to a better-suited persona.',
   };
 };
@@ -908,6 +1308,62 @@ const getPersonaProfile = (advisor) => {
     ...override,
     domainExpertise: override.domainExpertise || inferred.domainExpertise,
   };
+};
+
+const buildPersonaExecutionDirective = (advisor, profile = {}) => {
+  if (!profile) return '';
+
+  const advisorName = advisor?.name || 'Mentor';
+
+  const priorities = Array.isArray(profile.executionPriorities) && profile.executionPriorities.length
+    ? profile.executionPriorities
+    : ['run one concrete step now'];
+  const rejects = Array.isArray(profile.rejectPatterns) && profile.rejectPatterns.length
+    ? profile.rejectPatterns
+    : ['generic advice not tied to action'];
+  const signatureQuestion = String(profile.signatureQuestion || 'What is your next concrete step right now?').trim();
+
+  return [
+    `${advisorName} execution contract:`,
+    `Persona execution priorities: ${priorities.join('; ')}.`,
+    `Reject these patterns: ${rejects.join('; ')}.`,
+    `Anchor question style: ${signatureQuestion}`,
+  ].join('\n');
+};
+
+const buildMentorExecutionProtocol = ({ modeContext = null, userLevel = 'intermediate', activeGoal = '', nextCommitment = '', personalPerspectiveRequested = false }) => {
+  const context = modeContext || { isActionMode: false, domain: 'custom' };
+  const modeLabel = context.isActionMode ? 'action' : 'thinking';
+  const missingContext = [];
+
+  if (context.isActionMode) {
+    if (!context.hasOutcome) missingContext.push('exact measurable outcome');
+    if (!context.hasConstraint) missingContext.push('main constraint (time, budget, or risk)');
+    if (!context.tool) missingContext.push('tool/platform currently in use');
+  }
+
+  const missingContextLine = missingContext.length
+    ? `Missing context to collect first (max 2 questions): ${missingContext.slice(0, 2).join(' + ')}.`
+    : 'Core context is sufficient; move directly to execution.';
+
+  return `Mentor mode: ${modeLabel}. Domain: ${context.domain || 'custom'}. Level: ${userLevel}.
+Goal: ${activeGoal || 'not set'}.
+Next commitment: ${nextCommitment || 'none'}.
+${personalPerspectiveRequested ? 'User asked for your personal take: frame responses as conditional hypotheses, not commands.' : 'Do not decide for the user; coach their judgment.'}
+${context.isActionMode
+    ? `Action-mode protocol (mandatory):
+- Keep output process-driven, not essay-driven.
+- If critical context is missing, ask at most 2 targeted diagnosis questions.
+- Then declare a short plan and issue exactly one concrete step the user can do now.
+- End with an explicit completion checkpoint (e.g., "tell me when done" or "paste your draft").
+- If user is mid-step, do not reset the conversation with abstract advice.
+- Tie every line to user context (goal, constraints, tools, behavior) and avoid generic advice.
+${context.awaitingAction ? '- User is currently mid-step: ask for completion/draft before issuing a new framework.' : ''}
+${context.completionConfirmed ? '- User confirmed completion: acknowledge briefly, refine their output, then give next step.' : ''}
+${missingContextLine}`
+    : `Thinking-mode protocol:
+- Provide one sharp diagnosis, one tradeoff, and one concrete next action.
+- Keep language concise and avoid motivational filler.`}`;
 };
 
 const inferUserExperienceLevel = (history = []) => {
@@ -1106,6 +1562,17 @@ const VAGUE_INTENT_HINTS = new Set([
   'start',
 ]);
 
+const ACTION_INTENT_PATTERNS = /(help me|show me how|walk me through|step by step|roadmap|build|create|execute|write|draft|launch|start|next step|what should i do first|how do i do)/i;
+const THINKING_INTENT_PATTERNS = /^(what is|why|difference between|compare|explain|define)\b|philosoph|theory/i;
+const ACTION_COMPLETION_PATTERNS = /\b(done|completed|finished|all set|i did it|ready for next)\b/i;
+const ACTION_WAIT_SIGNAL_PATTERNS = /(tell me when .*done|once you.*done|when done|reply.*done|paste .*here|send .*draft|share what you wrote|let me know when you are done)/i;
+const TOOL_CONTEXT_PATTERNS = /(canva|powerpoint|ppt|google slides|slides|figma|excel|notion|word|docs?)/i;
+const DEVICE_PHONE_PATTERNS = /(phone|mobile|android|iphone|ios)/i;
+const DEVICE_COMPUTER_PATTERNS = /(laptop|desktop|computer|pc|mac)/i;
+const CONSTRAINT_HINT_PATTERNS = /(time|budget|cash|money|risk|deadline|hours?|days?|week|limited)/i;
+const OUTCOME_HINT_PATTERNS = /(target|goal|kpi|metric|outcome|by\s+\w+day|by\s+\d|\d+%|\d+\s*(users|clients|sales|trades|calls))/i;
+const GENERIC_ADVICE_PATTERNS = /(be clear|focus on value|demonstrate value|clear thinking|value proposition|stay focused|articulation of)/i;
+
 const isLightweightUserMessage = (text) => {
   const normalized = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
@@ -1142,7 +1609,74 @@ const toSentenceCase = (value) => {
 
 const toSingleLine = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
-const buildQuickReplyFromQuestion = (question, context = '') => {
+const extractPendingAssistantSignal = (history = []) => {
+  const lastAssistant = [...(history || [])].reverse().find((msg) => msg?.role === 'assistant');
+  if (!lastAssistant) {
+    return {
+      awaitingAction: false,
+      askedForDraft: false,
+      askedForTool: false,
+      lastDirective: '',
+    };
+  }
+
+  const parts = [];
+  if (typeof lastAssistant.content === 'string') {
+    parts.push(lastAssistant.content);
+  } else if (lastAssistant.content && typeof lastAssistant.content === 'object') {
+    parts.push(...(lastAssistant.content.bursts || []));
+    parts.push(lastAssistant.content.insight || '');
+    parts.push(...(lastAssistant.content.questions || []));
+    parts.push(...(lastAssistant.content.suggestedQuestions || []));
+  }
+
+  const combined = toSingleLine(parts.filter(Boolean).join(' '));
+  return {
+    awaitingAction: ACTION_WAIT_SIGNAL_PATTERNS.test(combined),
+    askedForDraft: /(paste|send|share).*(draft|sentence|slide|plan|version|what you wrote)/i.test(combined),
+    askedForTool: /(which tool|canva|powerpoint|google slides|what are you using)/i.test(combined),
+    lastDirective: combined.slice(0, 260),
+  };
+};
+
+const inferMentorModeContext = ({ userText = '', history = [], activeGoal = '' }) => {
+  const normalizedText = toSingleLine(userText).toLowerCase();
+  const pendingSignal = extractPendingAssistantSignal(history);
+  const completionConfirmed = ACTION_COMPLETION_PATTERNS.test(normalizedText);
+  const explicitThinking = THINKING_INTENT_PATTERNS.test(normalizedText) && !ACTION_INTENT_PATTERNS.test(normalizedText);
+  const explicitAction = ACTION_INTENT_PATTERNS.test(normalizedText) || pendingSignal.awaitingAction || completionConfirmed;
+  const isActionMode = explicitAction && !explicitThinking;
+
+  const scopeText = `${activeGoal || ''} ${userText || ''}`.trim();
+  const domain = inferDomainFromText(scopeText) || 'custom';
+  const toolMatch = scopeText.match(TOOL_CONTEXT_PATTERNS);
+  const device = DEVICE_PHONE_PATTERNS.test(scopeText)
+    ? 'phone'
+    : (DEVICE_COMPUTER_PATTERNS.test(scopeText) ? 'computer' : '');
+
+  return {
+    mode: isActionMode ? 'action' : 'thinking',
+    isActionMode,
+    domain,
+    awaitingAction: pendingSignal.awaitingAction && !completionConfirmed,
+    completionConfirmed,
+    askedForDraft: pendingSignal.askedForDraft,
+    askedForTool: pendingSignal.askedForTool,
+    tool: toolMatch ? toolMatch[0] : '',
+    device,
+    hasConstraint: CONSTRAINT_HINT_PATTERNS.test(scopeText),
+    hasOutcome: OUTCOME_HINT_PATTERNS.test(scopeText),
+    lastDirective: pendingSignal.lastDirective,
+  };
+};
+
+const ensureQuestionMark = (value) => {
+  const text = toSentenceCase(toSingleLine(value));
+  if (!text) return '';
+  return /\?$/.test(text) ? text : `${text}?`;
+};
+
+const buildUserQuestionFromMentorQuestion = (question, context = '') => {
   const text = toSingleLine(question).toLowerCase();
   const contextText = toSingleLine(context).toLowerCase();
   if (!text) return '';
@@ -1152,95 +1686,214 @@ const buildQuickReplyFromQuestion = (question, context = '') => {
   const isSales = /sales|pipeline|close|deal|outreach|conversion/.test(contextText);
   const isStartup = /startup|product|mvp|retention|users|launch/.test(contextText);
 
+  if (has('reply done', 'when done', 'tell me when done', 'let me know when you are done', 'ready for the next step')) {
+    return 'Can you give me the exact next step after I finish this one';
+  }
+
+  if (has('which tool', 'canva', 'powerpoint', 'google slides', 'what are you using')) {
+    return 'Which tool should I use right now on my device to move fastest';
+  }
+
+  if (has('paste what you wrote', 'paste your draft', 'send your draft', 'share your draft')) {
+    return 'Can you review and tighten this draft with your style';
+  }
+
+  if (has('48 hours', 'build and ship this week', 'ship this week')) {
+    return 'What is the leanest version I can ship in 48 hours for real signal';
+  }
+
   if (has('exact outcome', 'specific result', 'what one result', 'goal', 'target', 'outcome')) {
-    if (isTrading) return 'My target is 8 rule-compliant trades this week with max 2% total drawdown.';
-    if (isSales) return 'My target is 6 qualified calls booked this week from 40 outbound messages.';
-    if (isStartup) return 'My target is 15 activated users this week from the new onboarding flow.';
-    return 'My target is 2 signed clients this week from 20 qualified outreach messages.';
+    if (isTrading) return 'What would be a realistic weekly target for my setup and risk limits';
+    if (isSales) return 'What outcome target should I commit to this week in pipeline terms';
+    if (isStartup) return 'What is the right weekly activation target for this stage';
+    return 'What exact measurable outcome should I commit to this week';
   }
 
   if (has('constraint', 'time, cash, or risk', 'time, budget, or risk', 'resource')) {
-    if (isTrading) return 'My main constraint is risk; I can only risk 0.5% per trade right now.';
-    if (isSales) return 'My main constraint is time; I have a 90-minute daily outreach window.';
-    return 'My main constraint is cash; I can spend only $300 this month on experiments.';
+    if (isTrading) return 'Given my risk limits, how should I adjust the plan';
+    if (isSales) return 'Given my time limits, what is the highest-leverage sequence';
+    return 'Given my main constraint, what should I prioritize first';
   }
 
   if (has('move faster or reduce risk', 'go fast or de-risk', 'trade-off')) {
-    return 'I want to de-risk first with a 7-day pilot before scaling effort or budget.';
+    return 'Should I optimize for speed or de-risk first in this situation';
   }
 
   if (has('where is it breaking', 'where is it failing', 'bottleneck', 'stuck')) {
-    if (isTrading) return 'It breaks at execution; I exit early after one candle of pullback.';
-    if (isSales) return 'It breaks after first contact; prospects stop replying after pricing is shared.';
-    return 'It breaks at activation; users sign up but do not complete the second step.';
+    return 'Where do you think the main bottleneck is from what I shared';
   }
 
   if (has('metric', 'kpi', 'measure')) {
-    if (isTrading) return 'I track win rate and average R; this week I am at 38% win rate and 0.7R.';
-    if (isSales) return 'I track reply rate and call-booked rate; current values are 9% and 2.5%.';
-    return 'I track activation rate; current activation is 14% and target is 25%.';
+    return 'Which single metric should I track first to avoid noise';
   }
 
   if (has('deadline', 'by when', 'when will')) {
-    return 'I will complete the test by Thursday 6 PM and post the measured result that night.';
+    return 'What deadline would force execution without lowering quality';
   }
 
   if (has('risk', 'downside', 'worst case')) {
-    return 'Worst case is wasting one week, so I cap spend and stop if KPI does not improve by 20%.';
+    return 'What is the biggest downside here and how do I cap it';
   }
 
   if (has('assumption', 'assuming')) {
-    return 'I am assuming lead quality stays stable for two weeks while we test this change.';
+    return 'Which assumption in my plan is most dangerous right now';
   }
 
   if (has('next step', 'first step', 'action')) {
-    if (isTrading) return 'First step: predefine entry, stop, and invalidation rules before market open.';
-    if (isSales) return 'First step: call 10 warm leads today and ask for a specific next meeting date.';
-    return 'First step: run one focused experiment today and log the result in one metric.';
+    if (isTrading) return 'What is the first concrete action I should do before the next market session';
+    if (isSales) return 'What exact outreach action should I execute today';
+    return 'What is the first concrete action I should do in the next 20 minutes';
   }
 
   if (/^why\b/.test(text)) {
-    return 'Because this gives the fastest measurable signal with limited downside this week.';
+    return 'Why is this the best move now versus alternatives';
   }
 
   if (/^how\b/.test(text)) {
-    return 'I will run it in a 7-day test, track one KPI daily, and decide to scale on Friday.';
+    return 'How should I execute this step-by-step without overcomplicating it';
   }
 
   if (/^which\b/.test(text)) {
-    return 'I would choose the lower-risk path first, then scale once the metric trend is stable.';
+    return 'Which option would you choose in my constraints and why';
   }
 
   if (/^when\b/.test(text)) {
-    return 'I will start today at 4 PM and review outcomes every evening this week.';
+    return 'When should I execute this for the highest chance of follow-through';
   }
 
-  return 'I will execute one concrete test this week, track one KPI daily, and review on Friday.';
+  return 'What should I ask next to make this plan stronger before I execute';
+};
+
+const buildDomainNarrowingQuestions = ({ modeContext = null, forceClarifyingQuestions = false } = {}) => {
+  const domain = modeContext?.domain || 'custom';
+  const questions = [];
+
+  if (modeContext?.isActionMode) {
+    if (!modeContext?.hasOutcome) questions.push('What exact measurable result do you want from this task this week');
+    if (!modeContext?.hasConstraint) questions.push('Which hard constraint should drive decisions first: time, budget, or risk');
+    if (!modeContext?.tool) questions.push('What tool are you currently using so I can guide exact steps for it');
+  }
+
+  if (domain === 'fundraising' || /pitch|deck|investor/i.test(String(domain))) {
+    questions.push('Who is the investor audience and what stage are you raising for');
+  } else if (domain === 'trading') {
+    questions.push('What market and timeframe are you trading right now');
+  } else if (domain === 'sales') {
+    questions.push('Who is the exact buyer and what offer are you selling');
+  } else if (domain === 'startup') {
+    questions.push('Who is the user and what painful problem are they trying to solve now');
+  }
+
+  if (forceClarifyingQuestions && questions.length < 2) {
+    questions.push('What result would make this interaction a clear win for you');
+  }
+
+  return questions.map((item) => ensureQuestionMark(item)).filter(Boolean);
+};
+
+const curateMentorQuestions = (questions = [], options = {}) => {
+  const { modeContext = null, forceClarifyingQuestions = false } = options;
+  const cleaned = (Array.isArray(questions) ? questions : [])
+    .map((item) => ensureQuestionMark(item))
+    .filter(Boolean)
+    .filter((item) => {
+      const lowered = item.toLowerCase();
+      return !/(be clear|stay focused|value proposition|clear thinking)/i.test(lowered);
+    });
+
+  const narrowed = buildDomainNarrowingQuestions({ modeContext, forceClarifyingQuestions });
+  const combined = [...cleaned, ...narrowed];
+  const seen = new Set();
+  const unique = [];
+  combined.forEach((item) => {
+    const key = normalizeMentionKey(item);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    unique.push(item);
+  });
+
+  return unique.slice(0, (modeContext?.isActionMode || forceClarifyingQuestions) ? 2 : 3);
 };
 
 const alignSuggestedQuestions = (questions = [], suggestedQuestions = [], context = '') => {
+  const dedupe = (items = []) => {
+    const seen = new Set();
+    const output = [];
+    items.forEach((item) => {
+      const normalized = toSentenceCase(toSingleLine(item));
+      if (!normalized) return;
+      const key = normalizeMentionKey(normalized);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      output.push(normalized);
+    });
+    return output;
+  };
+
   const retrySuggestions = suggestedQuestions
     .map((item) => toSingleLine(item))
     .filter(Boolean)
     .filter((item) => /retry/i.test(item));
 
-  if (retrySuggestions.length) return retrySuggestions.slice(0, 3);
+  if (retrySuggestions.length) return dedupe(retrySuggestions).slice(0, 3);
 
   const questionAligned = questions
-    .map((question) => buildQuickReplyFromQuestion(question, context))
-    .map((item) => toSentenceCase(toSingleLine(item)))
+    .map((question) => buildUserQuestionFromMentorQuestion(question, context))
+    .map((item) => ensureQuestionMark(item))
     .filter(Boolean);
 
-  if (questionAligned.length) return questionAligned.slice(0, 3);
+  if (questionAligned.length) return dedupe(questionAligned).slice(0, 3);
 
-  return suggestedQuestions
-    .map((item) => toSentenceCase(toSingleLine(item)))
+  return dedupe(suggestedQuestions
+    .map((item) => ensureQuestionMark(item))
     .filter(Boolean)
-    .slice(0, 3);
+    .slice(0, 6)).slice(0, 3);
+};
+
+const buildDefaultQuestions = ({ forceClarifyingQuestions = false, actionMode = false, modeContext = null } = {}) => {
+  if (actionMode) {
+    const questions = [];
+    if (!(modeContext?.hasOutcome)) {
+      questions.push('What exact measurable outcome do you want by the end of this week?');
+    }
+    if (!(modeContext?.hasConstraint) && questions.length < 2) {
+      questions.push('Which constraint matters most right now: time, budget, or risk?');
+    }
+    if (!(modeContext?.tool) && questions.length < 2) {
+      questions.push('Which tool are you using right now: Canva, PowerPoint, Google Slides, or another app?');
+    }
+    if (modeContext?.awaitingAction && questions.length < 2) {
+      questions.push(modeContext?.askedForDraft
+        ? 'Paste what you created so I can tighten it before the next step.'
+        : 'Reply "done" when you finish this step so we can move to the next one.');
+    }
+    if (!questions.length) {
+      questions.push('What is one concrete action you will complete in the next 20 minutes?');
+      questions.push('Reply "done" after you complete it, and I will pressure-test your result.');
+    }
+    return curateMentorQuestions(questions, { modeContext, forceClarifyingQuestions: true }).slice(0, 2);
+  }
+
+  if (forceClarifyingQuestions) {
+    return curateMentorQuestions([
+      toSentenceCase('What specific result do you want by this Friday?'),
+      toSentenceCase('What is your main constraint right now: time, cash, or risk?'),
+    ], { modeContext, forceClarifyingQuestions: true });
+  }
+
+  return curateMentorQuestions([
+    toSentenceCase('Do you want to move faster or reduce risk first?'),
+    toSentenceCase('What one result matters most this week?'),
+  ], { modeContext, forceClarifyingQuestions: false });
 };
 
 const buildPayloadFromText = (text, options = {}) => {
-  const { lightweightMode = false, forceClarifyingQuestions = false } = options;
+  const {
+    lightweightMode = false,
+    forceClarifyingQuestions = false,
+    actionMode = false,
+    modeContext = null,
+  } = options;
   const sentences = getSentenceChunks(text);
 
   if (lightweightMode) {
@@ -1258,6 +1911,8 @@ const buildPayloadFromText = (text, options = {}) => {
   const insight = sentences[3] || '';
   const deepPoints = sentences.slice(4, 8);
 
+  const defaultQuestions = buildDefaultQuestions({ forceClarifyingQuestions, actionMode, modeContext });
+
   return {
     bursts: bursts.length ? bursts : ['Lets sharpen this one step at a time.'],
     insight,
@@ -1267,25 +1922,9 @@ const buildPayloadFromText = (text, options = {}) => {
           points: deepPoints,
         }
       : null,
-    questions: forceClarifyingQuestions
-      ? [
-          toSentenceCase('What specific result do you want by this Friday?'),
-          toSentenceCase('What is your main constraint right now: time, cash, or risk?'),
-        ]
-      : [
-          toSentenceCase('Do you want to move faster or reduce risk first?'),
-          toSentenceCase('What one result matters most this week?'),
-        ],
+    questions: curateMentorQuestions(defaultQuestions, { modeContext, forceClarifyingQuestions }),
     suggestedQuestions: alignSuggestedQuestions(
-      forceClarifyingQuestions
-        ? [
-            toSentenceCase('What specific result do you want by this Friday?'),
-            toSentenceCase('What is your main constraint right now: time, cash, or risk?'),
-          ]
-        : [
-            toSentenceCase('Do you want to move faster or reduce risk first?'),
-            toSentenceCase('What one result matters most this week?'),
-          ],
+      defaultQuestions,
       [],
       text
     ),
@@ -1293,11 +1932,16 @@ const buildPayloadFromText = (text, options = {}) => {
 };
 
 const normalizePayload = (raw, options = {}) => {
-  const { lightweightMode = false, forceClarifyingQuestions = false } = options;
-  if (!raw || typeof raw !== 'object') return buildPayloadFromText('', { lightweightMode, forceClarifyingQuestions });
+  const {
+    lightweightMode = false,
+    forceClarifyingQuestions = false,
+    actionMode = false,
+    modeContext = null,
+  } = options;
+  if (!raw || typeof raw !== 'object') return buildPayloadFromText('', { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
 
   const bursts = Array.isArray(raw.bursts)
-    ? raw.bursts.filter((item) => typeof item === 'string').map((item) => item.trim()).filter(Boolean).slice(0, lightweightMode ? 1 : 4)
+    ? raw.bursts.filter((item) => typeof item === 'string').map((item) => item.trim()).filter(Boolean).slice(0, lightweightMode ? 1 : (actionMode ? 2 : 4))
     : [];
 
   const insight = lightweightMode ? '' : (typeof raw.insight === 'string' ? raw.insight.trim() : '');
@@ -1315,9 +1959,9 @@ const normalizePayload = (raw, options = {}) => {
   const questions = !lightweightMode && Array.isArray(raw.questions)
     ? raw.questions
       .filter((item) => typeof item === 'string')
-      .map((item) => toSentenceCase(item))
+      .map((item) => ensureQuestionMark(item))
       .filter(Boolean)
-      .slice(0, forceClarifyingQuestions ? 2 : 3)
+      .slice(0, (forceClarifyingQuestions || actionMode) ? 2 : 3)
     : [];
 
   const suggestedQuestions = !lightweightMode && Array.isArray(raw.suggestedQuestions)
@@ -1328,34 +1972,45 @@ const normalizePayload = (raw, options = {}) => {
       .slice(0, 3)
     : [];
 
-  if (!bursts.length && !insight && !depthCard) return buildPayloadFromText('', { lightweightMode, forceClarifyingQuestions });
+  if (!bursts.length && !insight && !depthCard) {
+    return buildPayloadFromText('', { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
+  }
 
-  const resolvedQuestions = forceClarifyingQuestions
-    ? (questions.length
-      ? questions.slice(0, 2)
-      : [
-          toSentenceCase('What exact outcome do you want by the end of this week?'),
-          toSentenceCase('Which constraint matters most right now: time, budget, or risk?'),
-        ])
+  const fallbackQuestions = buildDefaultQuestions({ forceClarifyingQuestions, actionMode, modeContext });
+  const resolvedQuestions = (forceClarifyingQuestions || actionMode)
+    ? (questions.length ? questions.slice(0, 2) : fallbackQuestions)
     : questions;
+  const curatedQuestions = curateMentorQuestions(resolvedQuestions, { modeContext, forceClarifyingQuestions });
+
+  const normalizedBursts = bursts.length ? bursts : [lightweightMode ? 'Hey.' : 'Lets pressure-test this quickly.'];
+  const repairedBursts = actionMode && normalizedBursts.length && normalizedBursts.every((line) => GENERIC_ADVICE_PATTERNS.test(String(line || '').toLowerCase()))
+    ? ['Here is the immediate step: do one concrete action now and send your draft so we can refine it.']
+    : normalizedBursts;
 
   return {
-    bursts: bursts.length ? bursts : [lightweightMode ? 'Hey.' : 'Lets pressure-test this quickly.'],
+    bursts: repairedBursts,
     insight,
     depthCard,
-    questions: resolvedQuestions,
-    suggestedQuestions: alignSuggestedQuestions(resolvedQuestions, suggestedQuestions),
+    questions: curatedQuestions,
+    suggestedQuestions: alignSuggestedQuestions(curatedQuestions, suggestedQuestions, modeContext?.domain || ''),
   };
 };
 
 const parseModelResponse = (rawText, options = {}) => {
-  const { lightweightMode = false, forceClarifyingQuestions = false } = options;
-  if (!rawText || typeof rawText !== 'string') return buildPayloadFromText('', { lightweightMode, forceClarifyingQuestions });
+  const {
+    lightweightMode = false,
+    forceClarifyingQuestions = false,
+    actionMode = false,
+    modeContext = null,
+  } = options;
+  if (!rawText || typeof rawText !== 'string') {
+    return buildPayloadFromText('', { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
+  }
   try {
     const parsed = JSON.parse(rawText);
-    return normalizePayload(parsed, { lightweightMode, forceClarifyingQuestions });
+    return normalizePayload(parsed, { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
   } catch {
-    return buildPayloadFromText(rawText, { lightweightMode, forceClarifyingQuestions });
+    return buildPayloadFromText(rawText, { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
   }
 };
 
@@ -1775,24 +2430,14 @@ const App = () => {
   const handleSendMessageRef = useRef(null);
   const updateThreadFromAssistantMessageRef = useRef(null);
   const runContextTriggerSweepRef = useRef(null);
+  const communityIntentBatchRef = useRef({
+    timer: null,
+    queue: [],
+  });
+  const communityIntentRequestSeqRef = useRef(0);
   const [quickReplySignal, setQuickReplySignal] = useState(0);
-  const [revealedStrategicHintsByMessage, setRevealedStrategicHintsByMessage] = useState({});
 
   const [localStateLoaded, setLocalStateLoaded] = useState(false);
-
-  const getThreadHintContext = (threadId) => {
-    const history = chatHistories[threadId] || [];
-    return history
-      .filter((item) => item?.role === 'user')
-      .slice(-8)
-      .map((item) => String(item?.content || '').toLowerCase())
-      .join(' ');
-  };
-
-  const getStrategicQuestionHint = (question, context = '') => {
-    const example = buildQuickReplyFromQuestion(question, context);
-    return example ? `e.g., ${example}` : '';
-  };
 
   const buildSeedThreads = () => {
     const baseThreads = [
@@ -2064,15 +2709,18 @@ const App = () => {
     const picked = files.slice(0, availableSlots);
     if (!picked.length) return;
 
-    const built = [];
-    for (const file of picked) {
-      try {
-        const payload = await buildAttachmentPayload(file);
-        if (payload) built.push(payload);
-      } catch (error) {
-        console.error('Attachment processing failed:', error);
-      }
-    }
+    const builtResults = await Promise.all(
+      picked.map(async (file) => {
+        try {
+          return await buildAttachmentPayload(file);
+        } catch (error) {
+          console.error('Attachment processing failed:', error);
+          return null;
+        }
+      })
+    );
+
+    const built = builtResults.filter(Boolean);
 
     if (built.length) {
       setComposerAttachments((prev) => [...prev, ...built].slice(0, MAX_ATTACHMENT_COUNT));
@@ -2387,89 +3035,219 @@ const App = () => {
     return ['No clear strategy', 'Execution is inconsistent', 'I need faster progress', 'I need better decisions'];
   };
 
+  const requestCommunityIntentBoostBatch = useCallback(async (requestedIntents = []) => {
+    const intents = requestedIntents
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+
+    if (!intents.length) return new Map();
+
+    const apiKey = resolveApiKey();
+    if (!apiKey) return new Map();
+
+    const catalog = HISTORICAL_FIGURES
+      .map((advisor) => `${advisor.id}: ${advisor.name} - ${advisor.role}`)
+      .join('\n');
+    const validIds = new Set(HISTORICAL_FIGURES.map((advisor) => advisor.id));
+    const attempts = Math.max(1, Math.min(2, MAX_ATTEMPTS_PER_MODEL));
+
+    let lastFailures = [];
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const requestBody = {
+        systemInstruction: {
+          parts: [{
+            text: [
+              'You are a mentor-routing engine.',
+              'Return strict JSON only.',
+              'For each input intent, rank up to 8 mentor ids by relevance.',
+              'Use this schema exactly: {"results":[{"intent":"original intent text","ranked":[{"id":"advisorId","score":0-100,"reason":"short reason"}]}]}',
+              'Keep intent text exactly as provided in the request.',
+            ].join(' '),
+          }],
+        },
+        contents: [{
+          role: 'user',
+          parts: [{
+            text: [
+              `Intents (${intents.length}):`,
+              ...intents.map((intent, index) => `${index + 1}. ${intent}`),
+              'Mentor catalog:',
+              catalog,
+            ].join('\n'),
+          }],
+        }],
+        generationConfig: buildGenerationConfig({ responseMimeType: 'application/json' }),
+      };
+
+      let waveResult;
+      try {
+        waveResult = await runParallelModelRequestWave({
+          requestSignal: undefined,
+          requestBody,
+          endpointBuilder: (modelName) => `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+        });
+      } catch {
+        return new Map();
+      }
+
+      const { winner, failures = [] } = waveResult || {};
+      if (!winner) {
+        lastFailures = failures;
+        if (geminiServiceTierEnabled && failures.some((failure) => shouldDisableGeminiServiceTier(failure.status, failure.message))) {
+          geminiServiceTierEnabled = false;
+          continue;
+        }
+
+        const retryable = failures.some((failure) => failure.retryable);
+        const retryAfterMs = failures.reduce((maxMs, failure) => Math.max(maxMs, Number(failure.retryAfterMs || 0)), 0);
+        if (retryable && attempt < attempts - 1) {
+          await waitForRetry(getRetryDelayMs(attempt, retryAfterMs));
+          continue;
+        }
+        return new Map();
+      }
+
+      let parsed = null;
+      try {
+        const data = await winner.response.json();
+        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        parsed = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        parsed = null;
+      }
+
+      if (!parsed) {
+        if (attempt < attempts - 1) {
+          await waitForRetry(getRetryDelayMs(attempt));
+          continue;
+        }
+        return new Map();
+      }
+
+      const boostsByIntentKey = new Map();
+
+      if (Array.isArray(parsed?.results)) {
+        parsed.results.forEach((item) => {
+          const intentKey = normalizeIntentKey(item?.intent || item?.query || item?.input || '');
+          if (!intentKey) return;
+          const ranked = Array.isArray(item?.ranked) ? item.ranked : [];
+          boostsByIntentKey.set(intentKey, buildCommunityIntentBoostMap(ranked, validIds));
+        });
+      } else if (intents.length === 1 && Array.isArray(parsed?.ranked)) {
+        boostsByIntentKey.set(normalizeIntentKey(intents[0]), buildCommunityIntentBoostMap(parsed.ranked, validIds));
+      }
+
+      if (boostsByIntentKey.size) {
+        return boostsByIntentKey;
+      }
+
+      if (attempt < attempts - 1) {
+        await waitForRetry(getRetryDelayMs(attempt));
+        continue;
+      }
+    }
+
+    if (geminiServiceTierEnabled && lastFailures.some((failure) => shouldDisableGeminiServiceTier(failure.status, failure.message))) {
+      geminiServiceTierEnabled = false;
+    }
+
+    return new Map();
+  }, []);
+
+  const flushCommunityIntentBatchQueue = useCallback(async () => {
+    const batchRef = communityIntentBatchRef.current;
+    if (batchRef.timer) {
+      clearTimeout(batchRef.timer);
+      batchRef.timer = null;
+    }
+
+    const chunk = batchRef.queue.splice(0, COMMUNITY_INTENT_BATCH_MAX);
+    if (!chunk.length) return;
+
+    const groupedByIntentKey = new Map();
+    chunk.forEach((entry) => {
+      const normalizedIntent = String(entry?.intent || '').trim();
+      const intentKey = normalizeIntentKey(normalizedIntent);
+      if (!intentKey) {
+        entry?.resolve?.({});
+        return;
+      }
+
+      if (!groupedByIntentKey.has(intentKey)) {
+        groupedByIntentKey.set(intentKey, {
+          intent: normalizedIntent,
+          resolvers: [],
+        });
+      }
+      groupedByIntentKey.get(intentKey).resolvers.push(entry.resolve);
+    });
+
+    const uniqueIntents = Array.from(groupedByIntentKey.values()).map((item) => item.intent);
+    let boostsByIntentKey = new Map();
+    try {
+      boostsByIntentKey = await requestCommunityIntentBoostBatch(uniqueIntents);
+    } catch {
+      boostsByIntentKey = new Map();
+    }
+
+    groupedByIntentKey.forEach((group, intentKey) => {
+      const boost = boostsByIntentKey.get(intentKey) || {};
+      group.resolvers.forEach((resolve) => resolve(boost));
+    });
+
+    if (batchRef.queue.length && !batchRef.timer) {
+      batchRef.timer = setTimeout(() => {
+        void flushCommunityIntentBatchQueue();
+      }, COMMUNITY_INTENT_BATCH_WINDOW_MS);
+    }
+  }, [requestCommunityIntentBoostBatch]);
+
+  const enqueueCommunityIntentBoostRequest = useCallback((rawIntent) => {
+    const intent = String(rawIntent || '').trim();
+    if (!intent) return Promise.resolve({});
+
+    return new Promise((resolve) => {
+      const batchRef = communityIntentBatchRef.current;
+      batchRef.queue.push({ intent, resolve });
+
+      if (batchRef.queue.length >= COMMUNITY_INTENT_BATCH_MAX) {
+        if (batchRef.timer) {
+          clearTimeout(batchRef.timer);
+          batchRef.timer = null;
+        }
+        void flushCommunityIntentBatchQueue();
+        return;
+      }
+
+      if (!batchRef.timer) {
+        batchRef.timer = setTimeout(() => {
+          void flushCommunityIntentBatchQueue();
+        }, COMMUNITY_INTENT_BATCH_WINDOW_MS);
+      }
+    });
+  }, [flushCommunityIntentBatchQueue]);
+
   const suggestCommunityMentorsFromIntent = useCallback(async (rawIntent) => {
     const intent = String(rawIntent || '').trim();
     if (!intent) return;
 
+    const requestId = communityIntentRequestSeqRef.current + 1;
+    communityIntentRequestSeqRef.current = requestId;
+
     setCommunityIntentSuggesting(true);
     try {
-      const apiKey = resolveApiKey();
-      if (!apiKey) {
-        setCommunityAiIntentBoostById({});
-        return;
-      }
-
-      const catalog = HISTORICAL_FIGURES
-        .map((advisor) => `${advisor.id}: ${advisor.name} - ${advisor.role}`)
-        .join('\n');
-
-      let response = null;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${primaryModelName}:generateContent?key=${apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: {
-                parts: [{
-                  text: [
-                    'You are a mentor-routing engine.',
-                    'Return strict JSON only.',
-                    'Pick up to 8 most relevant mentor ids in order for the intent.',
-                    'Focus on direct relevance first, adjacent second, then broad strategists last.',
-                    'Schema: {"ranked":[{"id":"advisorId","score":0-100,"reason":"short reason"}] }',
-                  ].join(' '),
-                }],
-              },
-              contents: [{
-                role: 'user',
-                parts: [{
-                  text: `Intent: ${intent}\nMentor catalog:\n${catalog}`,
-                }],
-              }],
-              generationConfig: buildGenerationConfig({ responseMimeType: 'application/json' }),
-            }),
-          }
-        );
-
-        if (response.ok) break;
-
-        const failure = await parseApiFailure(response);
-        if (geminiServiceTierEnabled && shouldDisableGeminiServiceTier(failure.status, failure.message)) {
-          geminiServiceTierEnabled = false;
-          continue;
-        }
-        break;
-      }
-
-      if (!response?.ok) {
-        setCommunityAiIntentBoostById({});
-        return;
-      }
-
-      const data = await response.json();
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      const parsed = rawText ? JSON.parse(rawText) : null;
-      const ranked = Array.isArray(parsed?.ranked) ? parsed.ranked : [];
-      const validIds = new Set(HISTORICAL_FIGURES.map((advisor) => advisor.id));
-      const boost = {};
-
-      ranked.slice(0, 8).forEach((item, index) => {
-        const advisorId = String(item?.id || '').trim();
-        if (!advisorId || !validIds.has(advisorId)) return;
-        const score = Number(item?.score);
-        const normalized = Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : Math.max(50, 100 - (index * 10));
-        boost[advisorId] = Math.max(boost[advisorId] || 0, Math.round(normalized / 3));
-      });
-
-      setCommunityAiIntentBoostById(boost);
+      const boost = await enqueueCommunityIntentBoostRequest(intent);
+      if (communityIntentRequestSeqRef.current !== requestId) return;
+      setCommunityAiIntentBoostById(boost || {});
     } catch {
+      if (communityIntentRequestSeqRef.current !== requestId) return;
       setCommunityAiIntentBoostById({});
     } finally {
-      setCommunityIntentSuggesting(false);
+      if (communityIntentRequestSeqRef.current === requestId) {
+        setCommunityIntentSuggesting(false);
+      }
     }
-  }, []);
+  }, [enqueueCommunityIntentBoostRequest]);
 
   const launchMentorBoardFromIntent = async (intentText, mentors) => {
     const advisorIds = mentors.map((item) => item.advisor.id).slice(0, 3);
@@ -3634,6 +4412,14 @@ const App = () => {
       clearTimeout(onboardingTransitionRef.current);
       onboardingTransitionRef.current = null;
     }
+    if (communityIntentBatchRef.current.timer) {
+      clearTimeout(communityIntentBatchRef.current.timer);
+      communityIntentBatchRef.current.timer = null;
+    }
+    if (communityIntentBatchRef.current.queue.length) {
+      communityIntentBatchRef.current.queue.forEach((entry) => entry.resolve({}));
+      communityIntentBatchRef.current.queue = [];
+    }
     stopRecorderStream();
   }, []);
 
@@ -3862,95 +4648,54 @@ const App = () => {
       userLevel = 'intermediate',
       nextCommitment = '',
       personalPerspectiveRequested = false,
+      modeContext = null,
     } = options;
 
     const profile = advisor ? getPersonaProfile(advisor) : null;
-    const personaPrompt = [
-      advisor?.prompt || 'You are a strategic advisor.',
-      profile
-        ? `STRICT PERSONA ENFORCEMENT:
-- Name: ${advisor?.name || 'Unknown'} (Always stay in character as this person)
-- Expertise: ${profile.domainExpertise.join(', ')}
-- Thinking: ${profile.thinkingStyle}
-- Tone: ${profile.communicationTone}
-- Behavior: Regardless of whether the user addresses you by name or not, you must maintain this identity perfectly. Use the vocabulary, phraseology, and unique perspective of ${advisor?.name || 'your persona'}. Do not break character.`
-        : '',
-    ].filter(Boolean).join('\n');
+    const personaPrompt = advisor?.prompt || 'You are a strategic advisor.';
+    const personaId = profile
+      ? `You are ${advisor?.name}. Expertise: ${profile.domainExpertise.join(', ')}. Tone: ${profile.communicationTone}. Thinking style: ${profile.thinkingStyle}. Stay in character.`
+      : '';
 
-    const personaContext = thread.isGroup
-      ? `You are a member of a boardroom panel. Your current identity: ${advisor?.name || 'A Lead Specialist'}.\n\nOther panel members: ${thread.advisorIds.join(', ')}.\n\n${personaPrompt}`
-      : personaPrompt;
+    const personaBlock = thread.isGroup
+      ? `${personaId}\n${personaPrompt}\nBoardroom panel with: ${thread.advisorIds.join(', ')}.`
+      : `${personaId}\n${personaPrompt}`;
 
-    const contextLines = [
-      `Active goal: ${activeGoal || 'not explicitly set yet'}`,
-      `Inferred user level: ${userLevel}`,
-      `Pending commitment: ${nextCommitment || 'none captured'}`,
-    ].join('\n');
+    const protocolBlock = buildMentorExecutionProtocol({
+      modeContext,
+      userLevel,
+      activeGoal,
+      nextCommitment,
+      personalPerspectiveRequested,
+    });
+    const personaExecutionDirective = buildPersonaExecutionDirective(advisor, profile);
+    const modeSummary = modeContext?.isActionMode ? 'action' : 'thinking';
 
-    const personalPerspectiveRule = personalPerspectiveRequested
-      ? 'The user asked what you would personally do. If critical context is missing, ask briefly, then proceed with explicit assumptions: "Given limited info, I will assume...". Use conditional framing: "Given these conditions, I would lean toward...". Do not issue direct instructions. Include key risks, alternatives, and 1-2 follow-up questions.'
-      : 'If the user asks what you would personally do, first identify missing critical context (risk tolerance, timeframe, capital, constraints). Then provide a conditional personal perspective with explicit assumptions, risks, alternatives, and follow-up questions. Never present it as a directive.';
+    const ctx = `Goal: ${activeGoal || 'not set'}. Level: ${userLevel}. Thread: ${threadTitle}. Mode: ${modeSummary}. Domain: ${modeContext?.domain || inferDomainFromText(activeGoal) || 'custom'}. Tool: ${modeContext?.tool || 'unknown'}. Device: ${modeContext?.device || 'unknown'}.`;
+
+    const personalClause = personalPerspectiveRequested
+      ? " User asked for your personal take — answer in first-person (start with 'I would...' or 'I would likely...') using conditional framing and list your assumptions. Avoid phrasing your reply as direct commands to the user (do not use 'you should' as the persona voice)."
+      : '';
 
     if (lightweightMode) {
-      return `${personaPrompt}
-You are in an AI chat.
-Return ONLY valid JSON with this shape:
-{
-  "bursts": ["short natural reply"],
-  "insight": "",
-  "depthCard": null,
-  "questions": [],
-  "suggestedQuestions": []
-}
-Rules:
-- Keep it human and casual.
-- Single short burst only.
-- No deep analysis, no cards, no follow-up questions.
-- Keep guidance practical and specific.
-- Do not include markdown fences.
-${contextLines}
-Context thread: ${threadTitle}`;
+      return `${personaBlock}\n${protocolBlock}\n${personaExecutionDirective}\nJSON only: {"bursts":["short reply"],"insight":"","depthCard":null,"questions":[],"suggestedQuestions":[]}\nOne short burst, no card, no fences. If action mode is active, ask for one concrete next action with a completion check.\n${ctx}`;
     }
 
-    return `${personaPrompt}
-You are in an AI chat, not an essay response.
-Return ONLY valid JSON with this shape:
-{
-  "bursts": ["1-2 line message", "1-2 line message"],
-  "insight": "optional medium insight (1-3 lines)",
-  "depthCard": {"title": "optional title", "points": ["point", "point"]},
-  "questions": ["questions the persona asks the user"],
-  "suggestedQuestions": ["optional question suggestion user may ask back"]
-}
-Rules:
-- bursts max 4, each short and conversational.
-- Include at least one concrete action, one trade-off, and one assumption in your response.
-- Prioritize outcome-driven advice over theory.
-- Keep persona voice distinct and consistent with profile.
-- If user context or constraints are unclear (location, tools, capital, regulations), ask for it before specific recommendations; if unknown, proceed with explicit assumptions and provide globally feasible alternatives.
-- If user drifts off-topic, briefly acknowledge and tie back to the active goal; if user explicitly changes goal, adapt immediately and continue with the new goal.
-- Track continuity: reference user goal, past answers, and commitments when relevant.
-- ${vagueMode ? 'Ask exactly 1-2 sharp clarifying questions in questions to understand user intent.' : 'Ask at least 1 focused follow-up question in questions.'}
-- suggestedQuestions must be short, one-line, and phrased like realistic user replies that directly answer the questions.
-- In group settings, keep response scoped and avoid generic overlap.
-- ${personalPerspectiveRule}
-- Use emotional awareness: if user sounds confused or hesitant, simplify and reduce cognitive load.
-- Help the user feel trained, not just advised: propose small assignments and check for follow-through.
-- Do not include markdown fences.
-- Keep progression-oriented and interruptible.
-${contextLines}
-Context thread: ${threadTitle}`;
+    return `${personaBlock}\n${protocolBlock}\n${personaExecutionDirective}\nJSON only: {"bursts":["msg"],"insight":"optional","depthCard":null,"questions":[],"suggestedQuestions":[]}\nRules:\n- Max 2 bursts. Keep each burst concrete and outcome-driven.\n- Questions must be targeted and directly tied to the current step.\n- Suggested questions must be tappable user replies that advance execution.\n- Avoid generic principles unless linked to a specific decision or tradeoff.\n- No markdown fences.${vagueMode ? ' Keep diagnosis short and ask only what is missing.' : ''}${personalClause}\n${ctx}`;
   };
 
-  const tryStreamResponse = async ({ history, userText, systemPrompt, signal, threadId, assistantId, lightweightMode = false, forceClarifyingQuestions = false, attachmentParts = [] }) => {
+  const tryStreamResponse = async ({ history, userText, systemPrompt, signal, threadId, assistantId, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [], responseBudget = 'default' }) => {
     const apiKey = resolveApiKey();
     if (!apiKey) {
       throw new Error(MISSING_API_KEY_MESSAGE);
     }
 
     let lastError = null;
+    const deadlineController = new AbortController();
+    const deadlineId = setTimeout(() => deadlineController.abort(), lightweightMode ? Math.min(12000, MODEL_REQUEST_TIMEOUT_MS) : MODEL_REQUEST_TIMEOUT_MS);
+    const requestSignal = combineAbortSignals(signal, deadlineController.signal);
 
-    for (const modelName of modelCandidates) {
+    try {
       for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_MODEL; attempt += 1) {
         const requestBody = {
           contents: [
@@ -3961,22 +4706,65 @@ Context thread: ${threadTitle}`;
             { role: 'user', parts: [{ text: userText }, ...attachmentParts] },
           ],
           systemInstruction: { parts: [{ text: systemPrompt }] },
-          generationConfig: buildGenerationConfig(),
+          generationConfig: buildGenerationConfig(
+            responseBudget === 'reduced'
+              ? { maxOutputTokens: STREAM_RETRY_MAX_OUTPUT_TOKENS }
+              : {}
+          ),
         };
 
-        let streamResponse;
+        let waveResult;
         try {
-          streamResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse&key=${apiKey}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal,
-              body: JSON.stringify(requestBody),
-            }
-          );
+          waveResult = await runParallelModelRequestWave({
+            requestSignal,
+            requestBody,
+            endpointBuilder: (modelName) => `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse&key=${apiKey}`,
+          });
         } catch (error) {
-          lastError = new Error(normalizeApiFailureMessage(error?.message || 'Network request failed', 0));
+          if (error?.name === 'AbortError') throw normalizeAbortToTimeoutError(error, deadlineController.signal, signal);
+          lastError = new Error(normalizeApiFailureMessage(error?.message || 'Network request failed', Number(error?.status || 0)));
+          lastError.status = Number(error?.status || 0);
+          if (attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
+            await waitForRetry(getRetryDelayMs(attempt, Number(error?.retryAfterMs || 0)), signal);
+            continue;
+          }
+          break;
+        }
+
+        const { winner, failures = [] } = waveResult || {};
+
+        if (!winner) {
+          if (geminiServiceTierEnabled && failures.some((failure) => shouldDisableGeminiServiceTier(failure.status, failure.message))) {
+            geminiServiceTierEnabled = false;
+            continue;
+          }
+
+          const fatalFailure = failures.find((failure) => FATAL_HTTP_STATUSES.has(failure.status));
+          if (fatalFailure) {
+            const fatalError = new Error(normalizeApiFailureMessage(fatalFailure.message, fatalFailure.status));
+            fatalError.status = Number(fatalFailure.status || 0);
+            throw fatalError;
+          }
+
+          const preferredFailure = getPreferredFailure(failures);
+          if (preferredFailure) {
+            lastError = new Error(normalizeApiFailureMessage(preferredFailure.message, preferredFailure.status));
+            lastError.status = Number(preferredFailure.status || 0);
+          }
+
+          const retryable = failures.some((failure) => failure.retryable);
+          const retryAfterMs = failures.reduce((maxMs, failure) => Math.max(maxMs, Number(failure.retryAfterMs || 0)), 0);
+          if (retryable && attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
+            await waitForRetry(getRetryDelayMs(attempt, retryAfterMs), signal);
+            continue;
+          }
+          break;
+        }
+
+        const streamResponse = winner.response;
+        if (!streamResponse?.body || typeof streamResponse.body.getReader !== 'function') {
+          lastError = new Error('Streaming transport unavailable on this device.');
+          lastError.code = 'STREAM_UNAVAILABLE';
           if (attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
             await waitForRetry(getRetryDelayMs(attempt), signal);
             continue;
@@ -3984,101 +4772,114 @@ Context thread: ${threadTitle}`;
           break;
         }
 
-        if (!streamResponse.ok || !streamResponse.body) {
-          const failure = await parseApiFailure(streamResponse);
-          const message = normalizeApiFailureMessage(failure.message, failure.status);
-          const retryable = isRetryableApiFailure(failure.status, failure.message);
-          lastError = new Error(message);
-
-          if (geminiServiceTierEnabled && shouldDisableGeminiServiceTier(failure.status, failure.message)) {
-            geminiServiceTierEnabled = false;
-            continue;
-          }
-
-          if (FATAL_HTTP_STATUSES.has(failure.status)) {
-            throw lastError;
-          }
-
-          if (retryable && attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
-            await waitForRetry(getRetryDelayMs(attempt, failure.retryAfterMs), signal);
-            continue;
-          }
-
-          break;
-        }
-
         const reader = streamResponse.body.getReader();
         const decoder = new TextDecoder();
         let sseBuffer = '';
         let liveText = '';
+        let lastStreamUiUpdateAt = 0;
+        let pendingStreamUiUpdateTimer = null;
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (generationRef.current.interrupted) throw new DOMException('aborted', 'AbortError');
+        const flushStreamUiUpdate = () => {
+          pendingStreamUiUpdateTimer = null;
+          if (!liveText.trim() || generationRef.current.interrupted) return;
+          const livePayload = buildPayloadFromText(liveText, { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
+          updateAssistantMessage(threadId, assistantId, (current) => ({
+            ...current,
+            status: 'streaming',
+            content: {
+              ...current.content,
+              bursts: livePayload.bursts.slice(0, lightweightMode ? 1 : 3),
+            },
+          }));
+          lastStreamUiUpdateAt = Date.now();
+        };
 
-          sseBuffer += decoder.decode(value, { stream: true });
-          const events = sseBuffer.split('\n\n');
-          sseBuffer = events.pop() || '';
+        const scheduleStreamUiUpdate = () => {
+          if (generationRef.current.interrupted || pendingStreamUiUpdateTimer) return;
+          const elapsedMs = Date.now() - lastStreamUiUpdateAt;
+          const waitMs = Math.max(0, STREAM_RENDER_THROTTLE_MS - elapsedMs);
+          if (waitMs === 0) {
+            flushStreamUiUpdate();
+            return;
+          }
+          pendingStreamUiUpdateTimer = setTimeout(flushStreamUiUpdate, waitMs);
+        };
 
-          for (const event of events) {
-            const line = event
-              .split('\n')
-              .find((segment) => segment.startsWith('data:'));
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (generationRef.current.interrupted) throw new DOMException('aborted', 'AbortError');
 
-            if (!line) continue;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
+            sseBuffer += decoder.decode(value, { stream: true });
+            const events = sseBuffer.split('\n\n');
+            sseBuffer = events.pop() || '';
 
-            try {
-              const parsed = JSON.parse(raw);
-              const chunkText =
-                parsed.candidates?.[0]?.content?.parts
-                  ?.map((part) => part?.text || '')
-                  .join('') || '';
+            for (const event of events) {
+              const line = event
+                .split('\n')
+                .find((segment) => segment.startsWith('data:'));
 
-              if (chunkText) {
-                liveText = mergeStreamText(liveText, chunkText);
-                const livePayload = buildPayloadFromText(liveText, { lightweightMode, forceClarifyingQuestions });
-                updateAssistantMessage(threadId, assistantId, (current) => ({
-                  ...current,
-                  status: 'streaming',
-                  content: {
-                    ...current.content,
-                    bursts: livePayload.bursts.slice(0, lightweightMode ? 1 : 3),
-                  },
-                }));
+              if (!line) continue;
+              const raw = line.slice(5).trim();
+              if (!raw || raw === '[DONE]') continue;
+
+              try {
+                const parsed = JSON.parse(raw);
+                const chunkText =
+                  parsed.candidates?.[0]?.content?.parts
+                    ?.map((part) => part?.text || '')
+                    .join('') || '';
+
+                if (chunkText) {
+                  liveText = mergeStreamText(liveText, chunkText);
+                  scheduleStreamUiUpdate();
+                }
+              } catch {
+                continue;
               }
-            } catch {
-              continue;
             }
+          }
+        } finally {
+          if (pendingStreamUiUpdateTimer) {
+            clearTimeout(pendingStreamUiUpdateTimer);
+            pendingStreamUiUpdateTimer = null;
           }
         }
 
         if (liveText.trim()) {
-          return parseModelResponse(liveText, { lightweightMode, forceClarifyingQuestions });
+          flushStreamUiUpdate();
+          return parseModelResponse(liveText, { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
         }
 
         lastError = new Error('Model returned an empty stream response.');
+        lastError.code = 'EMPTY_STREAM';
         if (attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
           await waitForRetry(getRetryDelayMs(attempt), signal);
           continue;
         }
       }
-    }
 
-    throw lastError || new Error('Unable to generate response from available models.');
+      throw lastError || new Error('Unable to generate response from available models.');
+    } catch (error) {
+      throw normalizeAbortToTimeoutError(error, deadlineController.signal, signal);
+    } finally {
+      clearTimeout(deadlineId);
+    }
   };
 
-  const requestNonStreaming = async ({ history, userText, systemPrompt, signal, lightweightMode = false, forceClarifyingQuestions = false, attachmentParts = [] }) => {
+  const requestNonStreaming = async ({ history, userText, systemPrompt, signal, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [] }) => {
     const apiKey = resolveApiKey();
     if (!apiKey) {
       throw new Error(MISSING_API_KEY_MESSAGE);
     }
 
     let lastError = null;
+    const deadlineController = new AbortController();
+    const deadlineId = setTimeout(() => deadlineController.abort(), lightweightMode ? Math.min(12000, MODEL_REQUEST_TIMEOUT_MS) : MODEL_REQUEST_TIMEOUT_MS);
+    const requestSignal = combineAbortSignals(signal, deadlineController.signal);
 
-    for (const modelName of modelCandidates) {
+    try {
       for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_MODEL; attempt += 1) {
         const requestBody = {
           contents: [
@@ -4092,50 +4893,51 @@ Context thread: ${threadTitle}`;
           generationConfig: buildGenerationConfig({ responseMimeType: 'application/json' }),
         };
 
-        let response;
+        let waveResult;
         try {
-          response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal,
-              body: JSON.stringify(requestBody),
-            }
-          );
+          waveResult = await runParallelModelRequestWave({
+            requestSignal,
+            requestBody,
+            endpointBuilder: (modelName) => `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+          });
         } catch (error) {
-          lastError = new Error(normalizeApiFailureMessage(error?.message || 'Network request failed', 0));
+          if (error?.name === 'AbortError') throw normalizeAbortToTimeoutError(error, deadlineController.signal, signal);
+          lastError = new Error(normalizeApiFailureMessage(error?.message || 'Network request failed', Number(error?.status || 0)));
           if (attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
-            await waitForRetry(getRetryDelayMs(attempt), signal);
+            await waitForRetry(getRetryDelayMs(attempt, Number(error?.retryAfterMs || 0)), signal);
             continue;
           }
           break;
         }
 
-        if (!response.ok) {
-          const failure = await parseApiFailure(response);
-          const message = normalizeApiFailureMessage(failure.message, failure.status);
-          const retryable = isRetryableApiFailure(failure.status, failure.message);
-          lastError = new Error(message);
+        const { winner, failures = [] } = waveResult || {};
 
-          if (geminiServiceTierEnabled && shouldDisableGeminiServiceTier(failure.status, failure.message)) {
+        if (!winner) {
+          if (geminiServiceTierEnabled && failures.some((failure) => shouldDisableGeminiServiceTier(failure.status, failure.message))) {
             geminiServiceTierEnabled = false;
             continue;
           }
 
-          if (FATAL_HTTP_STATUSES.has(failure.status)) {
-            throw lastError;
+          const fatalFailure = failures.find((failure) => FATAL_HTTP_STATUSES.has(failure.status));
+          if (fatalFailure) {
+            throw new Error(normalizeApiFailureMessage(fatalFailure.message, fatalFailure.status));
           }
 
+          const preferredFailure = getPreferredFailure(failures);
+          if (preferredFailure) {
+            lastError = new Error(normalizeApiFailureMessage(preferredFailure.message, preferredFailure.status));
+          }
+
+          const retryable = failures.some((failure) => failure.retryable);
+          const retryAfterMs = failures.reduce((maxMs, failure) => Math.max(maxMs, Number(failure.retryAfterMs || 0)), 0);
           if (retryable && attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
-            await waitForRetry(getRetryDelayMs(attempt, failure.retryAfterMs), signal);
+            await waitForRetry(getRetryDelayMs(attempt, retryAfterMs), signal);
             continue;
           }
-
           break;
         }
 
-        const data = await response.json();
+        const data = await winner.response.json();
         const modelText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         if (!modelText.trim()) {
           lastError = new Error('Model returned an empty response.');
@@ -4146,11 +4948,15 @@ Context thread: ${threadTitle}`;
           break;
         }
 
-        return parseModelResponse(modelText, { lightweightMode, forceClarifyingQuestions });
+        return parseModelResponse(modelText, { lightweightMode, forceClarifyingQuestions, actionMode, modeContext });
       }
-    }
 
-    throw lastError || new Error('Unable to generate response from available models.');
+      throw lastError || new Error('Unable to generate response from available models.');
+    } catch (error) {
+      throw normalizeAbortToTimeoutError(error, deadlineController.signal, signal);
+    } finally {
+      clearTimeout(deadlineId);
+    }
   };
 
   const progressiveReveal = (threadId, assistantId, payload) => {
@@ -4197,7 +5003,7 @@ Context thread: ${threadTitle}`;
       });
 
       cursor += 1;
-    }, 35);
+    }, 12);
 
     generationRef.current.revealInterval = intervalId;
   };
@@ -4691,6 +5497,11 @@ Then secure a tomorrow commitment with specific action and time.`;
     const userLevel = inferUserExperienceLevel(modelHistory);
     const nextCommitment = formatCommitmentText(activeGoalPlan.nextCommitment);
     const personalPerspectiveRequested = isPersonalPerspectiveRequest(composedUserText);
+    const modeContext = inferMentorModeContext({
+      userText: composedUserText,
+      history: modelHistory,
+      activeGoal,
+    });
     const systemPrompt = `${buildSystemPrompt(activeThread.title, activeThread, mainAdvisor, {
       lightweightMode,
       vagueMode,
@@ -4698,6 +5509,7 @@ Then secure a tomorrow commitment with specific action and time.`;
       userLevel,
       nextCommitment,
       personalPerspectiveRequested,
+      modeContext,
     })}${mentionHint}${replyHint}${styleHint}${languageInstruction}`;
 
     try {
@@ -4785,11 +5597,19 @@ Then secure a tomorrow commitment with specific action and time.`;
             bursts: cleanedBursts.length ? cleanedBursts.slice(0, lightweightMode ? 1 : 2) : ['From my angle, focus on the highest-leverage next step.'],
             insight: lightweightMode ? '' : insight,
             depthCard: null,
-            questions: lightweightMode ? [] : (rawPayload?.questions || []).map((item) => toSentenceCase(item)).slice(0, 2),
+            questions: lightweightMode
+              ? []
+              : curateMentorQuestions((rawPayload?.questions || []).map((item) => ensureQuestionMark(item)), {
+                modeContext,
+                forceClarifyingQuestions: vagueMode,
+              }).slice(0, 2),
             suggestedQuestions: lightweightMode
               ? []
               : alignSuggestedQuestions(
-                (rawPayload?.questions || []).slice(0, 2),
+                curateMentorQuestions((rawPayload?.questions || []).slice(0, 2), {
+                  modeContext,
+                  forceClarifyingQuestions: vagueMode,
+                }),
                 (rawPayload?.suggestedQuestions || []).slice(0, 2),
                 composedUserText
               ),
@@ -4808,43 +5628,19 @@ Then secure a tomorrow commitment with specific action and time.`;
         const generatePayloadForAdvisor = async (advisorId, options = {}) => {
           const { preferStreaming = false, streamMessageId = null } = options;
           const advisor = HISTORICAL_FIGURES.find((entry) => entry.id === advisorId);
-          const profile = getPersonaProfile(advisor || {});
-          const advisorPrompt = `You are ${advisor?.name || 'the advisor'}. ${advisor?.prompt || 'You are a strategic advisor.'}
-Persona profile:
-- Domain expertise: ${profile.domainExpertise.join(', ')}
-- Thinking style: ${profile.thinkingStyle}
-- Communication tone: ${profile.communicationTone}
-- Stage relevance: ${profile.stageRelevance}
-- Decision bias: ${profile.decisionBias}
-- Confidence boundary: ${profile.confidenceBoundary}
-You are in an AI chat speaking in a group boardroom, not an essay response.
-Return ONLY valid JSON with this shape:
-{
-  "bursts": ["1-2 line message", "1-2 line message"],
-  "insight": "optional medium insight (1-3 lines)",
-  "depthCard": {"title": "optional title", "points": ["point", "point"]},
-  "questions": ["questions the persona asks the user"],
-  "suggestedQuestions": ["optional question suggestion user may ask back"]
-}
-Rules:
-- Stay in your own persona voice only.
-- Do not repeat wording from previous group members; check prior context.
-- Keep it short and conversational.
-- bursts max ${lightweightMode ? '1' : '4'}, each 1-2 lines.
-- Include at least one concrete action, one trade-off, and one assumption.
-- Keep advice context-aware and outcome-driven, not abstract.
-- If context is missing (risk tolerance, timeframe, capital, tools, location), ask briefly and state assumptions before specific guidance.
-- If user asks what you would do, respond conditionally: "Given these assumptions, I would lean toward..." and include risks, alternatives, and follow-up questions.
-- Never give direct prescriptive financial instructions.
-- ${lightweightMode ? 'Do not ask follow-up questions for casual messages.' : (vagueMode ? 'Ask exactly 1-2 sharp clarifying questions in questions.' : 'Ask at least 1 follow-up question in questions.')}
-- ${lightweightMode ? 'Keep questions and suggestedQuestions empty.' : 'Keep suggestedQuestions optional (0-2) and only when helpful.'}
-- Do not include markdown fences.
-- Do not include persona labels in the message.
-${styleHint}
-Goal context: ${activeGoal || 'not set'}
-User level: ${userLevel}
-Pending commitment: ${nextCommitment || 'none'}
-Context: ${activeThread.title}`;
+          const advisorPrompt = `${buildSystemPrompt(activeThread.title, activeThread, advisor, {
+            lightweightMode,
+            vagueMode,
+            activeGoal,
+            userLevel,
+            nextCommitment,
+            personalPerspectiveRequested,
+            modeContext,
+          })}
+Group responder rules:
+- No persona labels in output.
+- Do not repeat prior members.
+- If prior context exists, surface one explicit disagreement or tradeoff before your next step.`;
 
           const localizedAdvisorPrompt = `${advisorPrompt}${languageInstruction}`;
 
@@ -4865,6 +5661,8 @@ Context: ${activeThread.title}`;
                 assistantId: streamMessageId,
                 lightweightMode,
                 forceClarifyingQuestions: vagueMode,
+                actionMode: modeContext.isActionMode,
+                modeContext,
                 attachmentParts,
               });
             } catch {
@@ -4875,6 +5673,8 @@ Context: ${activeThread.title}`;
                 signal: controller.signal,
                 lightweightMode,
                 forceClarifyingQuestions: vagueMode,
+                actionMode: modeContext.isActionMode,
+                modeContext,
                 attachmentParts,
               });
             }
@@ -4886,6 +5686,8 @@ Context: ${activeThread.title}`;
               signal: controller.signal,
               lightweightMode,
               forceClarifyingQuestions: vagueMode,
+              actionMode: modeContext.isActionMode,
+              modeContext,
               attachmentParts,
             });
           }
@@ -5050,19 +5852,23 @@ Rules:
             }));
           }
 
-          for (let idx = 0; idx < secondaryAdvisorIds.length; idx += 1) {
-            if (generationRef.current.interrupted) break;
-            const advisorId = secondaryAdvisorIds[idx];
-            
-            // Background fetch for responsiveness
-            const payload = await generatePayloadForAdvisor(advisorId);
-            if (!payload) continue;
-            appendAdvisorMessage(advisorId, payload, `secondary-${idx}`);
+          if (secondaryAdvisorIds.length) {
+            const secondaryResults = await Promise.all(
+              secondaryAdvisorIds.map(async (advisorId, idx) => {
+                if (generationRef.current.interrupted) return null;
+                const payload = await generatePayloadForAdvisor(advisorId);
+                if (!payload) return null;
+                return { advisorId, payload, idx };
+              })
+            );
 
-            const delay = getDelayForOrdinal(idx + 2);
-            if (delay > 0) {
-              await waitForRetry(Math.min(delay, 120), controller.signal);
-            }
+            secondaryResults
+              .filter(Boolean)
+              .sort((a, b) => a.idx - b.idx)
+              .forEach(({ advisorId, payload, idx }) => {
+                if (generationRef.current.interrupted) return;
+                appendAdvisorMessage(advisorId, payload, `secondary-${idx}`);
+              });
           }
 
           if (!generationRef.current.interrupted && shouldEmitSynthesis) {
@@ -5079,29 +5885,48 @@ Rules:
 
       let payload;
       let usedStreaming = false;
-      try {
-        payload = await tryStreamResponse({
-          history: modelHistory,
-          userText: composedUserText,
-          systemPrompt,
-          signal: controller.signal,
-          threadId,
-          assistantId,
-          lightweightMode,
-          forceClarifyingQuestions: vagueMode,
-          attachmentParts,
-        });
-        usedStreaming = true;
-      } catch {
-        payload = await requestNonStreaming({
-          history: modelHistory,
-          userText: composedUserText,
-          systemPrompt,
-          signal: controller.signal,
-          lightweightMode,
-          forceClarifyingQuestions: vagueMode,
-          attachmentParts,
-        });
+      let streamError = null;
+      for (let streamAttempt = 0; streamAttempt < 2; streamAttempt += 1) {
+        try {
+          payload = await tryStreamResponse({
+            history: modelHistory,
+            userText: composedUserText,
+            systemPrompt,
+            signal: controller.signal,
+            threadId,
+            assistantId,
+            lightweightMode,
+            forceClarifyingQuestions: vagueMode,
+            actionMode: modeContext.isActionMode,
+            modeContext,
+            attachmentParts,
+            responseBudget: streamAttempt === 0 ? 'default' : 'reduced',
+          });
+          usedStreaming = true;
+          streamError = null;
+          break;
+        } catch (error) {
+          streamError = error;
+          if (error?.name === 'AbortError') throw error;
+        }
+      }
+
+      if (!usedStreaming) {
+        if (shouldFallbackToNonStreaming(streamError)) {
+          payload = await requestNonStreaming({
+            history: modelHistory,
+            userText: composedUserText,
+            systemPrompt,
+            signal: controller.signal,
+            lightweightMode,
+            forceClarifyingQuestions: vagueMode,
+            actionMode: modeContext.isActionMode,
+            modeContext,
+            attachmentParts,
+          });
+        } else {
+          throw streamError || new Error('Unable to generate response from available models.');
+        }
       }
 
       if (generationRef.current.interrupted) return;
@@ -5133,7 +5958,8 @@ Rules:
       const preview = payload.bursts?.[0] || payload.insight || 'Response received.';
       updateThreadFromAssistantMessage(threadId, preview, new Date().toISOString(), { authorAdvisorId: resolvedAdvisorId });
     } catch (err) {
-      if (err?.name === 'AbortError') {
+      const userInitiatedAbort = Boolean(generationRef.current.interrupted || controller?.signal?.aborted);
+      if (err?.name === 'AbortError' && (userInitiatedAbort || !appStateRef.current.isActive)) {
         const stillSameGeneration = generationRef.current.threadId === threadId;
         const backgroundInterrupted = !appStateRef.current.isActive;
 
@@ -5904,7 +6730,6 @@ Rules:
   const renderAssistantMessage = (msg, options = {}) => {
     const { isGroupChat = false, authorAdvisor = null, showHeader = true } = options;
     const content = typeof msg.content === 'object' && msg.content ? msg.content : buildPayloadFromText(String(msg.content || ''));
-    const hintContext = getThreadHintContext(activeThread?.id);
     return (
       <div className='space-y-2 max-w-[92%]'>
         {isGroupChat && authorAdvisor && showHeader && (
@@ -5938,14 +6763,7 @@ Rules:
           <div className='flex flex-col gap-2 pt-1'>
             <div className='flex items-center gap-1.5 px-1'>
               <HelpCircle size={13} className='text-blue-600 flex-shrink-0' />
-              <p className='text-[10px] font-black italic uppercase tracking-widest text-blue-700'>To better guide you</p>
-              <button
-                type='button'
-                onClick={() => setRevealedStrategicHintsByMessage((prev) => ({ ...prev, [msg.id]: !prev[msg.id] }))}
-                className='ml-auto text-[10px] font-black uppercase tracking-widest text-slate-500 hover:text-slate-700'
-              >
-                {revealedStrategicHintsByMessage[msg.id] ? 'Hide help' : 'Need help?'}
-              </button>
+              <p className='text-[10px] font-black italic uppercase tracking-widest text-blue-700'>Mentor needs from you</p>
             </div>
             <div className='flex flex-wrap gap-2'>
             {content.questions.map((question, questionIdx) => (
@@ -5954,11 +6772,6 @@ Rules:
                 className='px-3.5 py-2.5 bg-blue-50 border border-blue-200 text-blue-700 rounded-2xl text-[12px] leading-[1.4] font-bold italic text-left normal-case whitespace-normal max-w-full shadow-sm'
               >
                 <p>{toSentenceCase(question)}</p>
-                {revealedStrategicHintsByMessage[msg.id] && getStrategicQuestionHint(question, hintContext) && (
-                  <p className='mt-1 text-[10px] font-semibold not-italic text-slate-500'>
-                    {getStrategicQuestionHint(question, hintContext)}
-                  </p>
-                )}
               </div>
             ))}
             </div>
@@ -5969,7 +6782,7 @@ Rules:
           <div className='flex flex-col gap-2 pt-1'>
             <div className='flex items-center gap-1.5 px-1'>
               <Lightbulb size={13} className='text-emerald-600 flex-shrink-0' />
-              <p className='text-[10px] font-black italic uppercase tracking-widest text-emerald-700'>Start here</p>
+              <p className='text-[10px] font-black italic uppercase tracking-widest text-emerald-700'>Ask your mentor next</p>
             </div>
             <div className='flex flex-wrap gap-2'>
               {content.suggestedQuestions.map((question, questionIdx) => (
@@ -6003,7 +6816,6 @@ Rules:
   const renderChat = () => {
     const history = (chatHistories[activeThread.id] || []).filter((msg) => !isLegacyGateArtifactMessage(msg));
     const isGroupChat = Boolean(activeThread?.isGroup);
-    const hintContext = getThreadHintContext(activeThread?.id);
 
     return (
       <div className='flex flex-col h-full min-h-0 bg-transparent relative overflow-hidden'>
@@ -6162,14 +6974,7 @@ Rules:
                                   <div className='flex flex-col gap-2 pt-1'>
                                     <div className='flex items-center gap-1.5 px-1'>
                                       <HelpCircle size={13} className='text-blue-600 flex-shrink-0' />
-                                      <p className='text-[10px] font-black italic uppercase tracking-widest text-blue-700'>To better guide you</p>
-                                      <button
-                                        type='button'
-                                        onClick={() => setRevealedStrategicHintsByMessage((prev) => ({ ...prev, [msg.id]: !prev[msg.id] }))}
-                                        className='ml-auto text-[10px] font-black uppercase tracking-widest text-slate-500 hover:text-slate-700'
-                                      >
-                                        {revealedStrategicHintsByMessage[msg.id] ? 'Hide help' : 'Need help?'}
-                                      </button>
+                                      <p className='text-[10px] font-black italic uppercase tracking-widest text-blue-700'>Mentor needs from you</p>
                                     </div>
                                     <div className='flex flex-wrap gap-2'>
                                       {content.questions.map((question, questionIdx) => {
@@ -6199,11 +7004,6 @@ Rules:
                                             onMouseLeave={cancelMessageLongPress}
                                           >
                                             <p>{toSentenceCase(question)}</p>
-                                            {revealedStrategicHintsByMessage[msg.id] && getStrategicQuestionHint(question, hintContext) && (
-                                              <p className='mt-1 text-[10px] font-semibold not-italic text-slate-500'>
-                                                {getStrategicQuestionHint(question, hintContext)}
-                                              </p>
-                                            )}
                                           </div>
                                         );
                                       })}
@@ -6214,7 +7014,7 @@ Rules:
                                   <div className='flex flex-col gap-2 pt-1'>
                                     <div className='flex items-center gap-1.5 px-1'>
                                       <Lightbulb size={13} className='text-emerald-600 flex-shrink-0' />
-                                      <p className='text-[10px] font-black italic uppercase tracking-widest text-emerald-700'>Start here</p>
+                                      <p className='text-[10px] font-black italic uppercase tracking-widest text-emerald-700'>Ask your mentor next</p>
                                     </div>
                                     <div className='flex flex-wrap gap-2'>
                                       {content.suggestedQuestions.map((question, questionIdx) => (

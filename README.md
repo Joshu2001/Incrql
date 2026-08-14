@@ -36,8 +36,12 @@ Create a .env file from .env.example and set:
 
 ```bash
 VITE_GEMINI_API_KEY=your_key_here
-VITE_GEMINI_MODEL=gemini-2.5-flash
+VITE_GEMINI_MODEL=gemini-2.5-flash-lite
 VITE_GEMINI_FALLBACK_MODELS=gemini-2.5-flash
+VITE_GEMINI_MAX_ATTEMPTS=2
+VITE_GEMINI_BASE_RETRY_DELAY_MS=100
+# Optional, leave unset unless you know your key supports it:
+# VITE_GEMINI_SERVICE_TIER=priority
 ```
 
 The app retries transient model/network failures automatically with exponential backoff.

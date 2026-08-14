@@ -15,10 +15,18 @@ import {
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  Settings,
+  Server,
+  Cpu,
+  RefreshCw,
+  X,
+  Zap,
+  CheckCircle2,
+  AlertCircle,
 } from "lucide-react";
 
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
-const modelName = "gemini-2.5-flash";
+const modelName = import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-flash-lite";
 
 const buildFallbackThinking = (message, choices = ["Retry Session"]) => ({
   bursts: [message],
@@ -67,11 +75,17 @@ const normalizeThoughtData = (rawData) => {
       ? rawData.snapshot
       : null;
 
+  const actionCall =
+    rawData.actionCall && typeof rawData.actionCall.name === "string"
+      ? rawData.actionCall
+      : null;
+
   return {
     bursts: bursts.length ? bursts : ["Signal degraded. Reframe and retry."],
     choices,
     ...(strategy ? { strategy } : {}),
     ...(snapshot ? { snapshot } : {}),
+    ...(actionCall ? { actionCall } : {}),
   };
 };
 
@@ -227,6 +241,23 @@ const App = () => {
   const [isTyping, setIsTyping] = useState(false);
   const chatEndRef = useRef(null);
 
+  // Settings State
+  const [provider, setProvider] = useState(
+    () => localStorage.getItem("incirql_provider") || "gemini"
+  );
+  const [localUrl, setLocalUrl] = useState(
+    () => localStorage.getItem("incirql_local_url") || "http://127.0.0.1:1234/v1"
+  );
+  const [localModel, setLocalModel] = useState(
+    () => localStorage.getItem("incirql_local_model") || "llama3"
+  );
+  const [activeApiKey, setActiveApiKey] = useState(
+    () => localStorage.getItem("incirql_gemini_key") || apiKey
+  );
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState(null);
+
   const [threads, setThreads] = useState([
     {
       id: "1",
@@ -269,14 +300,60 @@ const App = () => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistories, isTyping, activeThread]);
 
-  const fetchAiThinking = async (userMessage, advisor, threadTitle, history) => {
-    if (!apiKey) {
-      return buildFallbackThinking(
-        "API key missing. Add VITE_GEMINI_API_KEY to .env and restart the app.",
-        ["Retry Session"]
-      );
+  const autoDetectLocalLlm = async () => {
+    setIsDetecting(true);
+    setConnectionStatus({ type: "info", msg: "Scanning local ports on device..." });
+
+    const endpoints = [
+      { name: "LM Playground / LM Studio (1234)", url: "http://127.0.0.1:1234/v1" },
+      { name: "Ollama (11434)", url: "http://127.0.0.1:11434/v1" },
+      { name: "llama.cpp / LocalAI (8080)", url: "http://127.0.0.1:8080/v1" },
+      { name: "vLLM (8000)", url: "http://127.0.0.1:8000/v1" },
+    ];
+
+    let found = null;
+
+    for (const ep of endpoints) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1800);
+        const res = await fetch(`${ep.url}/models`, {
+          method: "GET",
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          const data = await res.json();
+          const models = data?.data?.map((m) => m.id) || [];
+          found = { ...ep, model: models[0] || "default" };
+          break;
+        }
+      } catch {
+        // Continue checking next endpoint
+      }
     }
 
+    setIsDetecting(false);
+    if (found) {
+      setLocalUrl(found.url);
+      setLocalModel(found.model);
+      setProvider("local");
+      localStorage.setItem("incirql_local_url", found.url);
+      localStorage.setItem("incirql_local_model", found.model);
+      localStorage.setItem("incirql_provider", "local");
+      setConnectionStatus({
+        type: "success",
+        msg: `Connected to ${found.name} [Model: ${found.model}]`,
+      });
+    } else {
+      setConnectionStatus({
+        type: "error",
+        msg: "No active local LLM servers found on ports 1234, 11434, 8080, or 8000. Ensure server is running with CORS enabled.",
+      });
+    }
+  };
+
+  const fetchAiThinking = async (userMessage, advisor, threadTitle, history) => {
     if (!advisor?.prompt) {
       return buildFallbackThinking("Advisor link lost. Return to inbox and reopen this thread.");
     }
@@ -292,14 +369,80 @@ const App = () => {
       4. "strategy": Object { "title": "...", "points": ["Step 1", ...] }. Optional.
       5. "snapshot": Object { "action": "...", "risk": "...", "nextStep": "..." }. REQUIRED at the end of a core insight.
       6. "choices": Array of strings (interactive replies). Max 3.
+      7. "actionCall": Optional object { "name": "create_thread" | "switch_tab", "params": { ... } } if app manipulation is needed.
 
       Persona Check: If you are Peter Thiel, be contrarian and blunt. If you are Steve Jobs, be uncompromising and intense.
       Context Thread: ${threadTitle}
     `;
 
+    if (provider === "local") {
+      const cleanBaseUrl = localUrl.trim().replace(/\/+$/, "");
+      const targetUrl = cleanBaseUrl.endsWith("/v1")
+        ? `${cleanBaseUrl}/chat/completions`
+        : `${cleanBaseUrl}/v1/chat/completions`;
+
+      try {
+        const response = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: localModel || "default",
+            messages: [
+              { role: "system", content: systemPrompt },
+              ...history.map((msg) => ({
+                role: msg.role === "user" ? "user" : "assistant",
+                content:
+                  typeof msg.content === "string"
+                    ? msg.content
+                    : JSON.stringify(msg.content),
+              })),
+              { role: "user", content: userMessage },
+            ],
+            response_format: { type: "json_object" },
+            temperature: 0.7,
+          }),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => "");
+          return buildFallbackThinking(
+            `Local LLM server error ${response.status}. Check endpoint ${targetUrl}. ${errText.slice(0, 80)}`
+          );
+        }
+
+        const data = await response.json();
+        const rawContent = data.choices?.[0]?.message?.content;
+        if (!rawContent) {
+          return buildFallbackThinking("Local model returned empty content.");
+        }
+
+        try {
+          return normalizeThoughtData(JSON.parse(rawContent));
+        } catch {
+          const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            return normalizeThoughtData(JSON.parse(jsonMatch[0]));
+          }
+          return buildFallbackThinking("Local model output was not valid JSON. Ensure system prompt JSON mode is supported.");
+        }
+      } catch {
+        return buildFallbackThinking(
+          `Failed to connect to local LLM at ${localUrl}. Ensure server is running and CORS is enabled.`
+        );
+      }
+    }
+
+    // Default: Gemini API
+    if (!activeApiKey) {
+      return buildFallbackThinking(
+        "Gemini API key missing. Add key in Settings or set VITE_GEMINI_API_KEY in .env.",
+        ["Retry Session"]
+      );
+    }
+
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${activeApiKey}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -334,23 +477,47 @@ const App = () => {
         }
 
         return buildFallbackThinking(
-          `Model request failed (${response.status}). ${apiError || "Check API key permissions and network access."}`
+          `Gemini request failed (${response.status}). ${apiError || "Check API key and network."}`
         );
       }
 
       const data = await response.json();
       const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!rawText) {
-        return buildFallbackThinking("Model returned an empty response. Retry the request.");
+        return buildFallbackThinking("Model returned empty response. Retry request.");
       }
 
       try {
         return normalizeThoughtData(JSON.parse(rawText));
       } catch {
-        return buildFallbackThinking("Model response format was invalid. Retry the request.");
+        return buildFallbackThinking("Model response format invalid. Retry request.");
       }
-    } catch (err) {
+    } catch {
       return buildFallbackThinking("Thinking feed unstable. Re-syncing...");
+    }
+  };
+
+  const executeAppAction = (actionCall) => {
+    if (!actionCall || !actionCall.name) return;
+    if (actionCall.name === "create_thread") {
+      const advId = actionCall.params?.advisorId || "jobs";
+      const adv = HISTORICAL_FIGURES.find((m) => m.id === advId) || HISTORICAL_FIGURES[0];
+      const newT = {
+        id: Date.now().toString(),
+        title: actionCall.params?.title || adv.name,
+        isGroup: false,
+        advisorIds: [adv.id],
+        lastMsg: "New session initialized.",
+        time: "Now",
+        unread: 0,
+        status: "read",
+      };
+      setThreads((prev) => [newT, ...prev]);
+    } else if (actionCall.name === "switch_tab") {
+      if (actionCall.params?.tab) {
+        setActiveTab(actionCall.params.tab);
+        setActiveThread(null);
+      }
     }
   };
 
@@ -380,6 +547,10 @@ const App = () => {
         activeThread.title,
         history
       );
+
+      if (thoughtData.actionCall) {
+        executeAppAction(thoughtData.actionCall);
+      }
 
       const aiMsg = { role: "assistant", content: thoughtData, timestamp: new Date() };
       setChatHistories((prev) => ({
@@ -423,6 +594,171 @@ const App = () => {
     ></div>
   );
 
+  const SettingsModal = () => (
+    <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-300">
+      <div className="bg-white w-full max-w-md rounded-[2.5rem] p-6 shadow-2xl border border-sky-100 space-y-5 relative overflow-hidden">
+        <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-indigo-50 flex items-center justify-center text-indigo-600">
+              <Settings size={20} />
+            </div>
+            <div>
+              <h2 className="font-bold text-slate-900 text-base">LLM Settings</h2>
+              <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">
+                Cloud & On-Device Engine
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setIsSettingsOpen(false)}
+            className="w-9 h-9 rounded-full bg-slate-100 flex items-center justify-center text-slate-500 hover:bg-slate-200 transition-colors"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Provider Tabs */}
+        <div className="space-y-2">
+          <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+            Active Intelligence Provider
+          </label>
+          <div className="grid grid-cols-2 gap-2 bg-slate-100 p-1.5 rounded-2xl">
+            <button
+              onClick={() => {
+                setProvider("gemini");
+                localStorage.setItem("incirql_provider", "gemini");
+              }}
+              className={`py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-2 transition-all ${
+                provider === "gemini"
+                  ? "bg-white text-indigo-600 shadow-sm"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              <Zap size={14} /> Gemini Cloud
+            </button>
+            <button
+              onClick={() => {
+                setProvider("local");
+                localStorage.setItem("incirql_provider", "local");
+              }}
+              className={`py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-2 transition-all ${
+                provider === "local"
+                  ? "bg-white text-indigo-600 shadow-sm"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              <Cpu size={14} /> Local LLM
+            </button>
+          </div>
+        </div>
+
+        {provider === "local" ? (
+          <div className="space-y-4 animate-in fade-in duration-300">
+            <div className="bg-indigo-50/80 border border-indigo-100 p-3.5 rounded-2xl flex items-center justify-between">
+              <div>
+                <p className="text-[11px] font-bold text-slate-800">Auto-Detect Local LLM</p>
+                <p className="text-[9px] text-slate-500">Scans LM Playground (1234), Ollama (11434)...</p>
+              </div>
+              <button
+                onClick={autoDetectLocalLlm}
+                disabled={isDetecting}
+                className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-indigo-100 disabled:opacity-50 transition-all"
+              >
+                <RefreshCw size={13} className={isDetecting ? "animate-spin" : ""} />
+                {isDetecting ? "Scanning..." : "Detect"}
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                Local Server Base URL
+              </label>
+              <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl">
+                <Server size={16} className="text-slate-400" />
+                <input
+                  type="text"
+                  value={localUrl}
+                  onChange={(e) => {
+                    setLocalUrl(e.target.value);
+                    localStorage.setItem("incirql_local_url", e.target.value);
+                  }}
+                  placeholder="http://127.0.0.1:1234/v1"
+                  className="bg-transparent text-xs text-slate-800 outline-none w-full font-medium"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                Model Identifier
+              </label>
+              <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl">
+                <Cpu size={16} className="text-slate-400" />
+                <input
+                  type="text"
+                  value={localModel}
+                  onChange={(e) => {
+                    setLocalModel(e.target.value);
+                    localStorage.setItem("incirql_local_model", e.target.value);
+                  }}
+                  placeholder="llama3 or default"
+                  className="bg-transparent text-xs text-slate-800 outline-none w-full font-medium"
+                />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 animate-in fade-in duration-300">
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                Gemini API Key
+              </label>
+              <input
+                type="password"
+                value={activeApiKey}
+                onChange={(e) => {
+                  setActiveApiKey(e.target.value);
+                  localStorage.setItem("incirql_gemini_key", e.target.value);
+                }}
+                placeholder="AIzaSy..."
+                className="w-full bg-slate-50 border border-slate-200 px-3.5 py-2.5 rounded-2xl text-xs text-slate-800 outline-none font-medium"
+              />
+            </div>
+            <p className="text-[10px] text-slate-400">
+              Cloud Model: <span className="font-bold text-slate-700">{modelName}</span>
+            </p>
+          </div>
+        )}
+
+        {connectionStatus && (
+          <div
+            className={`p-3 rounded-2xl text-xs font-semibold flex items-start gap-2 ${
+              connectionStatus.type === "success"
+                ? "bg-emerald-50 text-emerald-800 border border-emerald-100"
+                : connectionStatus.type === "info"
+                ? "bg-sky-50 text-sky-800 border border-sky-100"
+                : "bg-rose-50 text-rose-800 border border-rose-100"
+            }`}
+          >
+            {connectionStatus.type === "success" ? (
+              <CheckCircle2 size={16} className="text-emerald-500 flex-shrink-0 mt-0.5" />
+            ) : (
+              <AlertCircle size={16} className="text-rose-500 flex-shrink-0 mt-0.5" />
+            )}
+            <span className="leading-snug">{connectionStatus.msg}</span>
+          </div>
+        )}
+
+        <button
+          onClick={() => setIsSettingsOpen(false)}
+          className="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-extrabold text-xs rounded-2xl shadow-lg transition-all"
+        >
+          Save & Close
+        </button>
+      </div>
+    </div>
+  );
+
   const Header = ({ title }) => (
     <header className="px-5 pt-12 pb-6 relative z-10 space-y-6">
       <div className="bg-white/90 backdrop-blur-md border border-white shadow-sm flex items-center px-4 py-3 rounded-2xl">
@@ -434,11 +770,30 @@ const App = () => {
           placeholder="What decision are you trying to make?"
           className="bg-transparent border-none outline-none text-sm w-full text-slate-800 placeholder:text-slate-400 font-medium"
         />
+        <button
+          onClick={() => setIsSettingsOpen(true)}
+          className="ml-2 p-1.5 text-slate-400 hover:text-indigo-600 transition-colors rounded-xl hover:bg-slate-100 flex-shrink-0"
+          title="Engine Settings"
+        >
+          <Settings size={18} />
+        </button>
       </div>
       <div className="flex items-center justify-between px-1">
-        <h1 className="text-xl font-black text-slate-900 tracking-tight uppercase italic">
-          {title}
-        </h1>
+        <div className="flex items-center gap-2">
+          <h1 className="text-xl font-black text-slate-900 tracking-tight uppercase italic">
+            {title}
+          </h1>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className={`text-[8px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border transition-all ${
+              provider === "local"
+                ? "bg-purple-50 text-purple-600 border-purple-200 hover:bg-purple-100"
+                : "bg-sky-50 text-sky-600 border-sky-200 hover:bg-sky-100"
+            }`}
+          >
+            {provider === "local" ? "Local LLM" : "Gemini Cloud"}
+          </button>
+        </div>
         <div className="flex items-center gap-1 rounded-full bg-white/80 border border-white/90 p-1 shadow-sm">
           {["All", "Unread", "Groups"].map((tag) => (
             <button
@@ -554,11 +909,15 @@ const App = () => {
               {activeThread.title}
             </h3>
             <p className="text-[9px] font-black text-indigo-600 uppercase tracking-widest mt-0.5">
-              {mainAdvisor?.name || "Advisor"} • BOARDROOM
+              {mainAdvisor?.name || "Advisor"} • {provider === "local" ? "LOCAL LLM" : "GEMINI CLOUD"}
             </p>
           </div>
-          <button className="p-1 text-slate-300">
-            <MoreVertical size={20} strokeWidth={2} />
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="p-1.5 text-slate-400 hover:text-indigo-600 transition-colors rounded-xl hover:bg-slate-100"
+            title="Engine Settings"
+          >
+            <Settings size={18} />
           </button>
         </header>
 
@@ -784,6 +1143,7 @@ const App = () => {
             ))}
           </nav>
         )}
+        {isSettingsOpen && <SettingsModal />}
       </div>
     </div>
   );
