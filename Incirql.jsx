@@ -4990,27 +4990,11 @@ const App = () => {
         throw new Error('Local model returned an empty response. Ensure model weights are loaded in LM Playground.');
       }
 
-      let parsedPayload = null;
-      try {
-        parsedPayload = JSON.parse(rawContent);
-      } catch {
-        const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          try {
-            parsedPayload = JSON.parse(jsonMatch[0]);
-          } catch {
-            parsedPayload = buildPayloadFromText(rawContent);
-          }
-        } else {
-          parsedPayload = buildPayloadFromText(rawContent);
-        }
-      }
-
-      return normalizeAssistantPayloadSchema(parsedPayload, {
-        allowQuestionFallback: true,
-        forceClarifyingQuestions: false,
-        actionMode: false,
-        modeContext: null,
+      return parseModelResponse(rawContent, {
+        lightweightMode,
+        forceClarifyingQuestions,
+        actionMode,
+        modeContext,
       });
     } catch (err) {
       if (err?.name === 'AbortError') throw err;
@@ -5018,7 +5002,7 @@ const App = () => {
     }
   };
 
-  const requestOnDeviceGguf = async ({ history, userText, systemPrompt, signal, attachmentParts = [] }) => {
+  const requestOnDeviceGguf = async ({ history, userText, systemPrompt, signal, lightweightMode = false, forceClarifyingQuestions = false, actionMode = false, modeContext = null, attachmentParts = [] }) => {
     const savedPath = (typeof window !== 'undefined' ? localStorage.getItem('incirql_native_model_path') : '') || '';
     if (!savedPath) {
       throw new Error('No on-device GGUF model loaded. Please select a .gguf model in Engine Settings.');
@@ -5034,27 +5018,11 @@ const App = () => {
       });
 
       const rawContent = res.text || res.content || '';
-      let parsedPayload = null;
-      try {
-        parsedPayload = JSON.parse(rawContent);
-      } catch {
-        const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          try {
-            parsedPayload = JSON.parse(jsonMatch[0]);
-          } catch {
-            parsedPayload = buildPayloadFromText(rawContent);
-          }
-        } else {
-          parsedPayload = buildPayloadFromText(rawContent || 'Generated response from on-device model.');
-        }
-      }
-
-      return normalizeAssistantPayloadSchema(parsedPayload, {
-        allowQuestionFallback: true,
-        forceClarifyingQuestions: false,
-        actionMode: false,
-        modeContext: null,
+      return parseModelResponse(rawContent, {
+        lightweightMode,
+        forceClarifyingQuestions,
+        actionMode,
+        modeContext,
       });
     } catch (err) {
       if (err?.name === 'AbortError') throw err;
