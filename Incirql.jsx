@@ -5045,18 +5045,47 @@ const App = () => {
       throw new Error('No on-device GGUF model loaded. Please select a .gguf model in Engine Settings.');
     }
 
-    const formattedPrompt = `${systemPrompt}\n\nUser: ${userText}\nAssistant:`;
+    // Extract a concise persona definition for lightweight on-device execution
+    let cleanSystem = 'You are a helpful and concise mentor. Give practical, sharp advice in 2-4 sentences.';
+    if (systemPrompt) {
+      const personaMatch = systemPrompt.match(/You are ([^.\n]+)/i);
+      if (personaMatch) {
+        cleanSystem = `You are ${personaMatch[1].trim()}. Respond in your distinct tone and style. Keep answers direct and concise (2-4 sentences max).`;
+      } else {
+        cleanSystem = systemPrompt.slice(0, 250).trim() + ' Respond directly and concisely.';
+      }
+    }
+
+    // Build standard ChatML prompt without duplicating instructions
+    const promptLines = [`<|im_start|>system\n${cleanSystem}<|im_end|>`];
+    
+    // Include last 2 turns of history if available
+    if (Array.isArray(history) && history.length > 0) {
+      const recentTurns = history.slice(-2);
+      for (const turn of recentTurns) {
+        if (turn.role === 'user') {
+          promptLines.push(`<|im_start|>user\n${(turn.content || '').slice(0, 200)}<|im_end|>`);
+        } else if (turn.role === 'assistant') {
+          promptLines.push(`<|im_start|>assistant\n${(turn.content || '').slice(0, 200)}<|im_end|>`);
+        }
+      }
+    }
+
+    promptLines.push(`<|im_start|>user\n${(userText || '').slice(0, 500)}<|im_end|>`);
+    promptLines.push('<|im_start|>assistant\n');
+
+    const formattedPrompt = promptLines.join('\n');
 
     try {
       const res = await NativeLlm.generateCompletion({
         prompt: formattedPrompt,
-        systemPrompt,
+        systemPrompt: '', // empty so native bridge does not double-concatenate
         temperature: 0.7,
       });
 
       const rawContent = res.text || res.content || '';
       return parseModelResponse(rawContent, {
-        lightweightMode,
+        lightweightMode: true,
         forceClarifyingQuestions,
         actionMode,
         modeContext,
