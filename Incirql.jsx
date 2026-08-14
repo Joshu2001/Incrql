@@ -8145,6 +8145,39 @@ Rules:
                   </div>
                 </div>
               )}
+
+              <div className='bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2'>
+                <p className='text-[10px] font-black uppercase tracking-wider text-slate-600 flex items-center gap-1.5'>
+                  <Sparkles size={11} className='text-amber-500' />
+                  Recommended Compatible Models (100% Offline)
+                </p>
+                <div className='space-y-1.5'>
+                  <a
+                    href='https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q4_k_m.gguf?download=true'
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className='flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200 hover:border-indigo-300 transition-all text-left text-slate-700'
+                  >
+                    <div>
+                      <p className='text-[10px] font-bold text-slate-800'>SmolLM2-360M-Instruct</p>
+                      <p className='text-[8.5px] text-slate-400'>220 MB • Fast & Lightweight • LLaMA Arch</p>
+                    </div>
+                    <span className='text-[9.5px] font-bold text-indigo-600'>Download ↗</span>
+                  </a>
+                  <a
+                    href='https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true'
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className='flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200 hover:border-indigo-300 transition-all text-left text-slate-700'
+                  >
+                    <div>
+                      <p className='text-[10px] font-bold text-slate-800'>Qwen2.5-0.5B-Instruct</p>
+                      <p className='text-[8.5px] text-slate-400'>350 MB • High Quality & Logic • Qwen Arch</p>
+                    </div>
+                    <span className='text-[9.5px] font-bold text-indigo-600'>Download ↗</span>
+                  </a>
+                </div>
+              </div>
             </div>
           ) : llmProvider === 'local' ? (
             <div className='space-y-3.5 animate-in fade-in duration-200'>
