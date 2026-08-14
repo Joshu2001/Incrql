@@ -2679,11 +2679,15 @@ const App = () => {
       });
     } catch (err) {
       setNativeModelStatus(null);
+      setNativeModelPath('');
+      setNativeModelName('');
+      localStorage.removeItem('incirql_native_model_path');
+      localStorage.removeItem('incirql_native_model_name');
       setModelLoadProgress(0);
       setModelLoadStepText('');
       setLocalDetectStatus({
         type: 'error',
-        msg: `Failed to load model: ${err.message || 'Architecture not supported by mobile llama.cpp'}`,
+        msg: `Failed to load model: ${err.message || 'Architecture not supported by mobile engine'}`,
       });
     } finally {
       setIsModelLoading(false);
